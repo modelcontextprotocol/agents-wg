@@ -27,7 +27,6 @@ Maintainers are responsible for:
 | Name | Organization | GitHub |
 |------|--------------|--------|
 | Luca Chang | AWS | [@LucaButBoring](https://github.com/LucaButBoring) |
-| Peter Alexander | Anthropic | [@pja-ant](https://github.com/pja-ant) |
 
 ### Active Contributors
 
