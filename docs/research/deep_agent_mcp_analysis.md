@@ -32,11 +32,10 @@ Supervisor service (application — not necessarily an MCP client)
 Orchestrator — top-level deep agent
         │
         ├── task() → Sub-agent A  (local: own LLM + tools + middleware)
-        ├── task() → Sub-agent B  (local)
+        ├── task() → Sub-agent B  (local: remote MCP servers)
         ├── task() → Sub-agent C  (local, may nest further)
         │
         ├── generic tools
-        ├── MCP servers            (remote tools — optional attachment)
         └── external agents        (e.g. A2A — optional)
         │
         ├── agent registry         (discover / register sub-agents)
