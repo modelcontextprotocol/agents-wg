@@ -58,29 +58,29 @@ remote tools or MCP-hosted agents are invoked.
 ```mermaid
 sequenceDiagram
     participant User
-    participant App as Supervisor service<br/>(application)
-    participant CK as Checkpoint / thread<br/>(application)
-    participant Orch as Orchestrator LLM<br/>(top-level deep agent)
-    participant Reg as Agent registry<br/>(application)
-    participant Sub as Sub-agent<br/>(local deep agent — OPAQUE)
-    participant Dom as Domain tools<br/>(sub-agent internal)
-    participant MCP as MCP server<br/>(remote — optional)
+    participant App as Supervisor service
+    participant CK as Checkpoint thread
+    participant Orch as Orchestrator LLM
+    participant Reg as Agent registry
+    participant Sub as Sub-agent OPAQUE
+    participant Dom as Domain tools
+    participant MCP as MCP server
 
     User->>App: request
     App->>CK: load thread state
     App->>Reg: resolve sub-agent roster
-    Reg-->>App: [agent-a, agent-b, agent-c]
+    Reg-->>App: agent-a, agent-b, agent-c
 
-    App->>Orch: messages + task() targets<br/>(bounded — not flat tool sprawl)
-    Orch-->>App: task(agent="agent-a", input=…)
+    App->>Orch: messages and bounded task targets
+    Orch-->>App: task agent-a with input
 
     App->>Sub: run sub-agent graph
     Note over Sub: own LLM, prompt, middleware
-    Sub->>Dom: run_sql, get_metrics, …
+    Sub->>Dom: run_sql, get_metrics
     Dom-->>Sub: results
 
     opt remote tools
-        Sub->>MCP: tools/call …
+        Sub->>MCP: tools/call
         MCP-->>Sub: CallToolResult
     end
 
@@ -126,13 +126,13 @@ When the deep-agent stack reaches **out** to MCP (optional attachment in diagram
 ```mermaid
 sequenceDiagram
     participant App as Supervisor service
-    participant Sub as Sub-agent<br/>(OPAQUE)
+    participant Sub as Sub-agent OPAQUE
     participant MCP as MCP server
 
-    Sub->>MCP: tools/call {name, arguments}
-    MCP-->>Sub: CallToolResult {resultType: "complete"}
+    Sub->>MCP: tools/call name and arguments
+    MCP-->>Sub: CallToolResult complete
 
-    Note over App,MCP: App may act as MCP client;<br/>sub-agent internals are not on MCP wire
+    Note over App,MCP: App acts as MCP client. Sub-agent internals stay off the wire.
 ```
 
 
@@ -144,13 +144,13 @@ sequenceDiagram
     participant App as Supervisor service
     participant MCP as MCP server
 
-    App->>MCP: tools/call + extensions.tasks {}
-    MCP-->>App: {resultType: "task", taskId, status: "working"}
+    App->>MCP: tools/call with tasks extension
+    MCP-->>App: resultType task, taskId, status working
     loop poll
-        App->>MCP: tasks/get {taskId}
-        MCP-->>App: working | completed
+        App->>MCP: tasks/get taskId
+        MCP-->>App: working or completed
     end
-    MCP-->>App: {status: "completed", result: …}
+    MCP-->>App: status completed with result
 ```
 
 
