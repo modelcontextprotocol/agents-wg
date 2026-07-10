@@ -1,417 +1,282 @@
-# Mapping Deep Agent Architecture to MCP Agents
+# Deep Agent Architecture vs MCP Surfaces
 
-> Observations on production deep-agent systems and how they map onto MCP primitives,
-> and where protocol gaps remain after existing features and extensions are applied.
-
-Production reference: [agent-supervisor-service](https://github.com/opsera-insights/opsera-ai/tree/main/agent-supervisor-service)
-(Deep Agents supervisor + MCP-backed sub-agents).
+> Can MCP (tools, Tasks extension, and related extensions) express what production
+> **deep-agent  systems** do  and where do protocol gaps remain?
 
 Aligned with [Agents WG approaches](https://github.com/modelcontextprotocol/agents-wg/pull/5) and
-diagram style from [mcp-agent-tools.md](./mcp-agent-tools.md).
+[mcp-agent-tools.md](./mcp-agent-tools.md).
 
 ---
 
-## MCP stack (current model)
+## Research question
+
+Production systems built with **Deep Agents / LangGraph** use a supervisor that delegates to
+**in-process sub-agents** (`task()`), each with its own LLM, tools, and middleware. MCP is often
+used for **remote tools**, not as the sub-agent runtime.
+
+**Question:** Which parts of that architecture have an MCP wire equivalent  and which parts stay application/framework-owned?
+
+---
+
+
+
+## Deep agent architecture (reference)
+
+Typical production layout:
 
 ```text
-MCP Core                    Extensions
-├── Tools                   ├── Tasks (SEP-2663 Final) — io.modelcontextprotocol/tasks
-├── Resources               ├── Skills (SEP-2640 Draft) — io.modelcontextprotocol/skills
-├── Prompts                 ├── MCP Apps (Stable) — io.modelcontextprotocol/ui
-└── Transports              └── Events (Triggers WG — ideating)
+Client (HTTP / chat UI)
+        ↓
+Supervisor service (application — not necessarily an MCP client)
+        ↓
+Orchestrator — top-level deep agent
+        │
+        ├── task() → Sub-agent A  (local: own LLM + tools + middleware)
+        ├── task() → Sub-agent B  (local)
+        ├── task() → Sub-agent C  (local, may nest further)
+        │
+        ├── generic tools
+        ├── MCP servers            (remote tools — optional attachment)
+        └── external agents        (e.g. A2A — optional)
+        │
+        ├── agent registry         (discover / register sub-agents)
+        ├── middleware             (routing, context, tracing, summarization)
+        └── checkpoint / thread    (conversation memory)
 ```
+
+**Delegation boundary:** the supervisor sees **named sub-agents**, not every domain tool.
+Sub-agent tools (`run_sql`, `search_docs`, …) stay inside the sub-agent — not on the supervisor.
 
 ---
 
-## Deep-agent pattern (production system)
 
-```text
-User
- ↓
-Supervisor          ← small surface: delegation + generic tools
- ↓ task(agent, …)
-Sub-agent             ← domain tools visible for sub-agent only
- ↓
-Tools (native + optional MCP)
-```
 
-**Delegation boundary:**
+## Sequence diagram — deep agent flow (application layer)
 
-```text
-Supervisor
-  ├── analytics-agent
-  ├── docs-agent
-  └── security-agent
-
-analytics-agent
-  ├── run_sql
-  ├── get_metrics
-  └── dashboards
-
-docs-agent
-  ├── search_docs
-  └── summarize
-```
-
-The delegation bounds **reasoning cost** and reduces wrong tool selection.
-Sub-agent tools are registered on the sub-agent config only—not on the supervisor.
-
----
-
-## What existing MCP already covers
-
-Reviewers on [PR #20](https://github.com/modelcontextprotocol/agents-wg/pull/20) are correct that
-much of the production deep-agent pattern maps to **Approach 1** (agent hosted behind a tool call)
-with the client acting as supervisor:
-
-| WG approach | Production mapping | MCP primitive |
-|-------------|-------------------|---------------|
-| **Approach 1** | Sub-agent = `tools/call` on `invoke_*_agent` | Core `tools/call` |
-| **Tasks extension** | Long-running sub-agent work | `resultType: "task"` + `tasks/get` |
-| **Skills extension** | Workflow instructions for a domain | `resources/read` `skill://…` |
-| **MCP Apps** | Rich UI on tool result | `_meta.ui.resourceUri` |
-
-The sections below use sequence diagrams to show **what works today**, **what Tasks adds**,
-and **what gaps remain**.
-
----
-
-## Flow 1: Client-as-supervisor, sub-agent-as-tool (sync)
-
-Maps to [Approach 1](https://github.com/modelcontextprotocol/agents-wg/pull/5) and Deep Agents
-`task(agent="analytics-agent", …)` when the sub-agent is one MCP tool.
-
-### Interface
-
-| Field | Value |
-|---|---|
-| Supervisor | MCP Client (LangGraph / Deep Agents harness) |
-| Sub-agent surface | Tool name e.g. `invoke_analytics_agent` |
-| Input | `{query: string, …}` (server-defined schema) |
-| Output | `CallToolResult` with `resultType: "complete"` |
-| Extension | None required |
-
-### Behavior
-
-1. Supervisor LLM receives a **bounded tool list** (delegate tools only, not flat domain tools).
-2. LLM selects `invoke_analytics_agent`.
-3. Client issues `tools/call`.
-4. Server runs an internal agent loop (OPAQUE) and returns the final result.
-5. Supervisor LLM incorporates the result and responds to the user.
-
-### Sequence diagram
+What happens **inside** a supervisor service. Nothing here is standardized MCP unless
+remote tools or MCP-hosted agents are invoked.
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Sup as MCP Client<br/>(Supervisor / Deep Agents)
-    participant LLM as Supervisor LLM
-    participant Srv as MCP Server
-    participant Sub as Sub-agent loop<br/>(OPAQUE)
+    participant App as Supervisor service<br/>(application)
+    participant CK as Checkpoint / thread<br/>(application)
+    participant Orch as Orchestrator LLM<br/>(top-level deep agent)
+    participant Reg as Agent registry<br/>(application)
+    participant Sub as Sub-agent<br/>(local deep agent — OPAQUE)
+    participant Dom as Domain tools<br/>(sub-agent internal)
+    participant MCP as MCP server<br/>(remote — optional)
 
-    User->>Sup: "Q4 revenue by region"
-    Sup->>LLM: messages + tools:<br/>[invoke_analytics_agent,<br/>invoke_docs_agent, …]
-    LLM-->>Sup: tool_call: invoke_analytics_agent<br/>{query: "Q4 revenue by region"}
+    User->>App: request
+    App->>CK: load thread state
+    App->>Reg: resolve sub-agent roster
+    Reg-->>App: [agent-a, agent-b, agent-c]
 
-    Sup->>Srv: tools/call invoke_analytics_agent<br/>{query: "Q4 revenue by region"}
+    App->>Orch: messages + task() targets<br/>(bounded — not flat tool sprawl)
+    Orch-->>App: task(agent="agent-a", input=…)
 
-    Srv->>Sub: run domain agent
-    Note over Sub: OPAQUE:<br/>may call run_sql, get_metrics<br/>internally — not on MCP wire
-    Sub-->>Srv: structured result
+    App->>Sub: run sub-agent graph
+    Note over Sub: own LLM, prompt, middleware
+    Sub->>Dom: run_sql, get_metrics, …
+    Dom-->>Sub: results
 
-    Srv-->>Sup: CallToolResult<br/>{resultType: "complete", content: [...]}
-    Sup->>LLM: tool result
-    LLM-->>Sup: final answer
-    Sup-->>User: response
-```
-
-### Opaque boundary
-
-Everything inside the server's sub-agent loop is opaque from the MCP client's perspective.
-The client has no visibility into:
-
-- Which internal tools the sub-agent invoked
-- The sub-agent's system prompt or model choice
-- Intermediate reasoning steps
-
-The contract is `tools/call` → `CallToolResult`. This matches production patterns documented
-in [mcp-agent-tools.md](./mcp-agent-tools.md) (Q Business, GitHub Copilot).
-
-### Limitations
-
-**MCP-induced:**
-
-- No standard `agents/list`; supervisor tool surface is **client-configured**, not server-advertised.
-- No mid-loop message from sub-agent back to supervisor LLM (see Flow 5).
-
----
-
-## Flow 2: Sub-agent-as-tool with Tasks extension (async)
-
-Maps to Approach 1 + [SEP-2663 Tasks](https://modelcontextprotocol.io/seps/2663-tasks-extension).
-Same delegation pattern; server returns a task handle instead of blocking.
-
-### Interface
-
-| Field | Value |
-|---|---|
-| Extension | `io.modelcontextprotocol/tasks` in per-request client capabilities |
-| Task methods | `tasks/get`, `tasks/update`, `tasks/cancel` |
-| Async discriminator | `resultType: "task"` on initial `tools/call` response |
-
-### Behavior
-
-1. Client declares Tasks extension in `_meta.io.modelcontextprotocol/clientCapabilities`.
-2. Server may return `CreateTaskResult` instead of `CallToolResult` for long work.
-3. Client polls `tasks/get` until terminal status (`completed`, `failed`, `cancelled`).
-4. On `completed`, `result` field carries the same shape `tools/call` would have returned.
-
-### Sequence diagram
-
-```mermaid
-sequenceDiagram
-    participant Sup as MCP Client<br/>(Supervisor)
-    participant Srv as MCP Server
-    participant Sub as Sub-agent loop<br/>(OPAQUE)
-
-    Note over Sup,Srv: Client declares<br/>extensions.io.modelcontextprotocol/tasks {}
-
-    Sup->>Srv: tools/call invoke_analytics_agent<br/>{query: "…"}<br/>_meta.clientCapabilities.extensions.tasks {}
-
-    Srv->>Sub: start long-running job
-  Note over Sub: OPAQUE: research, SQL,<br/>aggregation — minutes not seconds
-    Srv-->>Sup: {resultType: "task", taskId,<br/>status: "working", pollIntervalMs}
-
-    loop until terminal
-        Sup->>Srv: tasks/get {taskId}<br/>header: Mcp-Name: {taskId}
-        Srv-->>Sup: {status: "working", statusMessage?}
+    opt remote tools
+        Sub->>MCP: tools/call …
+        MCP-->>Sub: CallToolResult
     end
 
-    Srv-->>Sup: {status: "completed",<br/>result: CallToolResult}
-    Sup->>Sup: merge result into<br/>checkpoint / thread state
+    Sub-->>App: sub-agent result
+    App->>CK: merge into state
+    App->>Orch: sub-agent output
+    Orch-->>App: final answer
+    App-->>User: response
 ```
 
-### Opaque boundary
 
-Tasks expose **job state** (`working`, `statusMessage`, `completed.result`), not sub-agent
-inner-loop steps. Polling is client responsibility unless the host wraps it transparently.
-
-### Limitations
-
-**MCP-induced:**
-
-- Task state ≠ supervisor conversation checkpoint (client-owned).
-- `subscriptions/listen` + Tasks notifications still a conformance fast-follow.
-- Missing `Mcp-Name` on `tasks/get|update|cancel` → `-32001` per SEP-2243/2663.
 
 ---
 
-## Flow 3: `input_required` mid-flight (Tasks + MRTR)
 
-When the sub-agent needs user input during a long task.
 
-### Interface
+## MCP surfaces (what the protocol defines)
 
-| Field | Value |
-|---|---|
-| Status | `input_required` on `tasks/get` response |
-| Pending work | `inputRequests` map (MRTR shape) |
-| Client reply | `tasks/update` with `inputResponses` |
+What exists **on the wire** between an MCP client and server:
 
-### Sequence diagram
+
+| Surface            | Identifier / method              | Role                                    |
+| ------------------ | -------------------------------- | --------------------------------------- |
+| Tool call          | `tools/call`                     | Stateless request → result              |
+| Tool discovery     | `tools/list`                     | Flat list of tool schemas               |
+| Async job          | `io.modelcontextprotocol/tasks`  | `resultType: "task"` → `tasks/get` poll |
+| Workflow docs      | `io.modelcontextprotocol/skills` | `resources/read` `skill://…`            |
+| Rich UI            | `io.modelcontextprotocol/ui`     | `_meta.ui` on tools/resources           |
+| User input mid-job | Tasks + MRTR                     | `input_required` → `tasks/update`       |
+
+
+MCP does **not** define: supervisor graphs, `task(agent=…)`, agent registries, checkpoints,
+middleware, or model routing.
+
+---
+
+
+
+## Sequence diagram — MCP surface (remote tool call only)
+
+When the deep-agent stack reaches **out** to MCP (optional attachment in diagram above):
 
 ```mermaid
 sequenceDiagram
-    participant Sup as MCP Client<br/>(Supervisor)
-    participant User
-    participant Srv as MCP Server
+    participant App as Supervisor service
+    participant Sub as Sub-agent<br/>(OPAQUE)
+    participant MCP as MCP server
 
-    Sup->>Srv: tasks/get {taskId}
-    Srv-->>Sup: {status: "input_required",<br/>inputRequests: {elicitation-1: {method: "elicitation/create", …}}}
+    Sub->>MCP: tools/call {name, arguments}
+    MCP-->>Sub: CallToolResult {resultType: "complete"}
 
-    Sup->>User: present elicitation prompt
-    User-->>Sup: answer
+    Note over App,MCP: App may act as MCP client;<br/>sub-agent internals are not on MCP wire
+```
 
-    Sup->>Srv: tasks/update {taskId,<br/>inputResponses: {elicitation-1: …}}
-    Srv-->>Sup: ack (empty result)
 
-    loop poll until terminal
-        Sup->>Srv: tasks/get {taskId}
+
+With **Tasks extension** for long remote work:
+
+```mermaid
+sequenceDiagram
+    participant App as Supervisor service
+    participant MCP as MCP server
+
+    App->>MCP: tools/call + extensions.tasks {}
+    MCP-->>App: {resultType: "task", taskId, status: "working"}
+    loop poll
+        App->>MCP: tasks/get {taskId}
+        MCP-->>App: working | completed
     end
-
-    Srv-->>Sup: {status: "completed", result: …}
+    MCP-->>App: {status: "completed", result: …}
 ```
 
-### Limitations
 
-**Protocol gap:**
-
-- `input_required` targets the **user** via elicitation, not the **supervisor LLM**.
-- No standard primitive for sub-agent → parent-agent messaging mid-loop
-  ([2026-04-21 meeting](https://github.com/modelcontextprotocol/agents-wg/blob/main/meetings/2026-04-21.md)).
 
 ---
 
-## Flow 4: Tool sprawl (default MCP) vs bounded delegation (production)
 
-Contrasts what MCP exposes by default with what deep-agent supervisors use.
 
-### Behavior — tool sprawl (anti-pattern MCP enables)
+## Deep agent vs MCP — component mapping
 
-1. Client calls `tools/list`.
-2. Server returns **all** tools including domain-level `run_sql`, `search_docs`, etc.
-3. Supervisor LLM sees every tool; wrong-domain picks increase cost and latency.
 
-### Sequence diagram — tool sprawl
+| Deep agent component                   | MCP surface today                      | Match?                       |
+| -------------------------------------- | -------------------------------------- | ---------------------------- |
+| Orchestrator / supervisor loop         | —                                      | ❌ Application-owned          |
+| `task()` delegation to named sub-agent | —                                      | ❌ No wire primitive          |
+| Agent registry (sub-agent roster)      | `tools/list` (flat)                    | ❌ No `agents/list`           |
+| Sub-agent LLM + middleware             | —                                      | ❌ In-process only            |
+| Domain tools inside sub-agent          | Server-internal or separate MCP server | ⚠️ Not visible to supervisor |
+| Checkpoint / thread memory             | —                                      | ❌ Application-owned          |
+| Model routing middleware               | —                                      | ❌ Application-owned          |
+| Remote capability                      | `tools/call`                           | ✅                            |
+| Long-running remote work               | Tasks extension                        | ✅                            |
+| Workflow instructions                  | Skills extension                       | 🧪 Draft                     |
+| Rich result UI                         | MCP Apps                               | ✅ (orthogonal)               |
+| External agents                        | A2A (separate protocol)                | ✅ Parallel track             |
 
-```mermaid
-sequenceDiagram
-    participant Sup as MCP Client<br/>(Supervisor)
-    participant LLM as Supervisor LLM
-    participant Srv as MCP Server
-
-    Sup->>Srv: tools/list
-    Srv-->>Sup: [run_sql, get_metrics, search_docs,<br/>summarize, scan_repo, …]
-
-    Sup->>LLM: all N tools in context
-    LLM-->>Sup: tool_call: run_sql<br/>(may be wrong domain)
-
-    Sup->>Srv: tools/call run_sql {…}
-    Srv-->>Sup: result or error
-```
-
-### Behavior — bounded delegation (production pattern)
-
-1. Client configures supervisor to see **delegate tools only**
-   (`invoke_analytics_agent`, `invoke_docs_agent`, …).
-2. Domain tools exist only inside the server sub-agent loop (Flow 1).
-
-### Sequence diagram — bounded delegation
-
-```mermaid
-sequenceDiagram
-    participant Sup as MCP Client<br/>(Supervisor)
-    participant LLM as Supervisor LLM
-    participant Srv as MCP Server
-    participant Sub as Sub-agent loop<br/>(OPAQUE)
-
-    Note over Sup: Client config filters tools/list<br/>to delegate surface only (3 tools, not 30)
-
-    Sup->>LLM: tools: [invoke_analytics_agent,<br/>invoke_docs_agent, invoke_security_agent]
-    LLM-->>Sup: tool_call: invoke_analytics_agent
-
-    Sup->>Srv: tools/call invoke_analytics_agent {query}
-    Srv->>Sub: OPAQUE loop uses run_sql, get_metrics internally
-    Sub-->>Srv: result
-    Srv-->>Sup: CallToolResult
-```
-
-### Gap
-
-Client-side filtering **works** but is **not portable**: a new host connecting to the same
-server gets full `tools/list` unless it reimplements the same filter. A server-advertised
-**agent capability card** (`agents/list` or equivalent) would standardize this boundary.
 
 ---
 
-## Flow 5: Skills before delegation (optional layer)
 
-[SEP-2640 Skills](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640) —
-workflow docs over MCP resources; does not replace sub-agent delegation.
 
-### Sequence diagram
+## Alternative topology (WG Approach 1)
 
-```mermaid
-sequenceDiagram
-    participant Sup as MCP Client<br/>(Supervisor)
-    participant Srv as MCP Server
-
-    Note over Sup,Srv: extensions.io.modelcontextprotocol/skills {}
-
-    Sup->>Srv: resources/read skill://analytics-agent/SKILL.md
-    Srv-->>Sup: workflow instructions (markdown)
-
-    Sup->>Sup: inject skill into supervisor<br/>or sub-agent context
-
-    Sup->>Srv: tools/call invoke_analytics_agent {query}
-    Srv-->>Sup: CallToolResult
-```
-
-### Limitations
-
-Skills teach **how** to orchestrate; they do not bind **which tools** the supervisor may call.
-
----
-
-## Flow 6: Proposed — server-advertised agent capability card
-
-Not implemented. Sketches [Approach 3 / 6](https://github.com/modelcontextprotocol/agents-wg/pull/5).
-
-### Sequence diagram
-
-```mermaid
-sequenceDiagram
-    participant Sup as MCP Client<br/>(Supervisor)
-    participant LLM as Supervisor LLM
-    participant Srv as MCP Server
-
-    Sup->>Srv: agents/list (hypothetical)
-    Srv-->>Sup: [{agentId: "analytics-agent",<br/>delegateTool: "invoke_analytics_agent",<br/>internalTools: [run_sql, …],<br/>tasksEnabled: true}, …]
-
-    Sup->>Sup: build supervisor tool surface<br/>from agent cards (portable across hosts)
-
-    Sup->>LLM: bounded delegate tools only
-    LLM-->>Sup: tool_call: invoke_analytics_agent
-    Sup->>Srv: tools/call invoke_analytics_agent {query}
-    Srv-->>Sup: CallToolResult or CreateTaskResult
-```
-
----
-
-## MCP primitive coverage (summary)
-
-| Production need | Deep Agents | MCP today | Gap? |
-|-----------------|-------------|-----------|------|
-| Tool call | Sub-agent invokes tools | ✅ `tools/call` | No |
-| Long-running work | Supervisor tracks jobs | ✅ Tasks extension | No (with client poll) |
-| Agent / delegation boundary | 3 delegate tools, not 30 | ⚠️ Client filter only | **Yes — portability** |
-| Thread / checkpoint memory | Mongo / LangGraph | Client-owned | Out of MCP scope |
-| Sub-agent → supervisor mid-loop | Parent LLM callback | ❌ No primitive | **Yes — caller-directed messaging** |
-| Parallel sub-agents | Fan-out in graph | ⚠️ Multiple `tools/call` | Partial — no task DAG |
-| Model routing | Middleware per call | Client-only | Out of scope for v0 |
-
----
-
-## Proposed layering (direction for WG)
+If each sub-agent were **re-hosted as an MCP server** (one tool per agent), an MCP **client**
+could play supervisor — but that **changes the architecture**:
 
 ```text
-Agent          ← definition + capability card (Flow 6 — gap)
- ↓
-Task           ← long-running unit of work (Flow 2 — SEP-2663)
- ↓
-Sub-agent      ← executor behind tool (Flow 1 — Approach 1)
- ↓
-Tool           ← MCP core ✅
+Deep agent (today)     MCP Approach 1 (different shape)
+─────────────────      ────────────────────────────────
+local task()      →    tools/call invoke_agent_a
+in-process sub-agents → opaque server-side agent loops
+one service       →    N MCP servers + MCP client supervisor
+```
+
+See [mcp-agent-tools.md](./mcp-agent-tools.md) for production examples (sync and async).
+
+This is **interoperable** but **not equivalent** to in-process deep-agent delegation.
+
+---
+
+
+
+## Gaps worth raising with the WG
+
+
+| Gap                              | Deep agent need                        | MCP today               |
+| -------------------------------- | -------------------------------------- | ----------------------- |
+| **Agent discovery**              | Supervisor reasons over agent names    | Flat `tools/list` only  |
+| **Portable delegation boundary** | Registry defines who can be tasked     | Per-app config          |
+| **Caller-directed messaging**    | Sub-agent asks supervisor LLM mid-loop | Elicitation = user only |
+| **Job vs conversation state**    | Thread checkpoint ≠ async job          | Tasks = job handle only |
+
+
+**Not asking MCP to own:** graph execution, checkpoints, middleware, model routing.
+
+---
+
+
+
+## Primitive coverage (reference)
+
+
+| Production need                 | Deep agent stack            | MCP surface       | Gap?                  |
+| ------------------------------- | --------------------------- | ----------------- | --------------------- |
+| Tool call                       | Sub-agent uses domain tools | ✅ `tools/call`    | No (remote)           |
+| Long-running remote work        | App tracks async MCP jobs   | ✅ Tasks           | No (with poll)        |
+| Named sub-agent delegation      | `task(agent=…)`             | ❌                 | **Yes**               |
+| Agent / sub-agent registry      | Bounded supervisor surface  | ⚠️ client config  | **Yes — portability** |
+| Thread / checkpoint             | App database                | ❌                 | Out of scope          |
+| Sub-agent → supervisor mid-loop | Parent LLM callback         | ❌                 | **Yes**               |
+| Parallel sub-agents             | Fan-out in graph            | ⚠️ multiple calls | Partial               |
+| Model routing                   | Middleware                  | ❌                 | Out of scope          |
+| Workflow docs                   | Prompts / skills            | 🧪 Skills         | Complements agents    |
+| Rich UI                         | App rendering               | ✅ MCP Apps        | Orthogonal            |
+
+
+
+
+### Layering (WG direction)
+
+```text
+Agent capability card  ← gap (discovery / delegation boundary)
+Task                   ← SEP-2663 ✅
+Sub-agent as MCP tool  ← Approach 1 ✅ (different topology)
+Tool                   ← core ✅
 ```
 
 ---
 
-## Notes
 
-This document represents ongoing exploration. **Existing MCP features cover Approach 1 + Tasks.**
-The open questions for the WG are whether **agent capability discovery** (Flow 4 vs Flow 6) and
-**caller-directed messaging** (Flow 3 limitation) warrant protocol work.
 
-Feedback, corrections, and alternative approaches are welcome.
+## Summary
+
+
+| Layer                                                        | Who owns it                |
+| ------------------------------------------------------------ | -------------------------- |
+| Supervisor graph, `task()`, registry, checkpoint, middleware | **Deep agent application** |
+| Remote tools, async job handles, skills, UI extensions       | **MCP surfaces**           |
+
+
+MCP **complements** deep-agent architectures (remote tools + Tasks). It does **not** yet
+**surface** the in-process supervisor/sub-agent model on the wire. The open WG question is
+whether a lightweight **agent capability card** is enough — without putting LangGraph on the protocol.
 
 ---
+
+
 
 ## References
 
 - [PR #20 — this research](https://github.com/modelcontextprotocol/agents-wg/pull/20)
 - [Agents WG approaches (PR #5)](https://github.com/modelcontextprotocol/agents-wg/pull/5)
-- [mcp-agent-tools.md](./mcp-agent-tools.md) — production Approach 1 examples + diagram style
+- [mcp-agent-tools.md](./mcp-agent-tools.md)
 - [SEP-2663 Tasks Extension](https://modelcontextprotocol.io/seps/2663-tasks-extension)
 - [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/harness)
-- [2026-04-21 — agents vs tasks, sub-agent communication](https://github.com/modelcontextprotocol/agents-wg/blob/main/meetings/2026-04-21.md)
-- [2026-05-29 — tasks conformance, extension versioning](https://github.com/modelcontextprotocol/agents-wg/blob/main/meetings/2026-05-29.md)
+- [2026-04-21 — sub-agent communication](https://github.com/modelcontextprotocol/agents-wg/blob/main/meetings/2026-04-21.md)
+- [2026-05-29 — Tasks conformance, versioning](https://github.com/modelcontextprotocol/agents-wg/blob/main/meetings/2026-05-29.md)
+
