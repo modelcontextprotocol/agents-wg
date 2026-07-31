@@ -17,9 +17,22 @@ This document:
 
 1. Introduces **Deep Agents** ([docs](https://docs.langchain.com/oss/python/deepagents/subagents)) — lineage from LangChain / LangGraph, capabilities, skills, and how tools/subagents attach
 2. Contrasts that shape with a typical MCP **server / tools** sequence
-3. Proposes **one ask for now: agent definition** — so hosts can route like deep agents without adopting a specific runtime
+3. Proposes **Proposal 1: agent-first discovery** (`agents/list` → `agents/get` → scoped `tools/call`), including a **Python SDK registration sketch** for builders (§6.6)
+4. Captures **WG session Q&A** (approaches, objections, pros/cons) in the FAQ
 
 Other Agents WG approaches exist ([PR #5](https://github.com/modelcontextprotocol/agents-wg/pull/5)). This doc uses the **supervisor–subagent tree** as the reference stress test.
+
+### Terms used throughout
+
+| Term | Meaning |
+| ---- | ------- |
+| **Host / MCP client** | App that owns the LLM(s) and speaks MCP |
+| **MCP server** | Exposes tools / resources / prompts (no LLM required) |
+| **Roster / agent card** | `{ name, description, capabilities[] }` — **labels only**, no tool schemas |
+| **Scoped tools** | Tool schemas visible only after selecting an agent |
+| **Progressive disclosure** | Small discovery first; detail on demand |
+| **Catalog mode** | Host builds a **local** sub-agent LLM from `agents/get`; leaf work still uses `tools/call` on the same server |
+| **Capability negotiation** | `initialize` advertises `capabilities.agents` → host chooses agent-first vs flat tools |
 
 ---
 
@@ -324,11 +337,18 @@ sequenceDiagram
 | Long remote jobs | App + optional Tasks | ✅ Tasks |
 | Workflow / how-to docs | Prompts; optional Skills | 🧪 Skills |
 | Rich UI | App or MCP Apps | ✅ MCP Apps |
-| Opaque remote agent-as-tool | Optional | ✅ Approach 1 |
+| Opaque remote agent-as-tool | Optional | ✅ Approach C (below) |
 
 ---
 
-## 6. Ask 1: Agent definition
+## 6. Proposal 1: Agent-first discovery
+
+> **After sync with WG discussion** (including comments from [@lucabutboring](https://github.com/lucabutboring) on catalog-style local sub-agents):  
+> `agents/list` is **roster-only** (no tool names/schemas). Hosts that advertise
+> `capabilities.agents` must **not** call flat `tools/list` at connect — otherwise the
+> supervisor sees agents **and** all tools (square one). Tool schemas appear only after
+> `agents/get` for the selected agent; leaf execution stays `tools/call` on the **same**
+> server. LLMs stay on the host.
 
 Deep agents scale because the supervisor sees an **agent registry**, not every tool:
 
@@ -336,72 +356,250 @@ Deep agents scale because the supervisor sees an **agent registry**, not every t
 BAD (flat tools as discovery):
   Orchestrator sees 70 tool schemas → picks the tool itself → sprawl, mis-routes
 
-GOOD (agent definition / registry):
-  Orchestrator sees 3 agent tuples → routes to workflow-agent → that agent picks the tool
+GOOD (agent-first discovery):
+  Orchestrator sees 3 agent cards → selects workflow-agent →
+  host loads THAT agent’s tools only → specialist picks the tool
 ```
 
-That registry:
+### 6.1 What changes on the wire (additive)
 
-1. Surfaces **capabilities** without tool sprawl
-2. Routes question → **agent**, not question → one of 70 tools
-3. **Scopes** each turn to one specialist’s tools and prompt
-4. Lets the tree **grow** (add an agent = a few roster lines, not dozens of schemas)
+| Piece | Role |
+| ----- | ---- |
+| `initialize` → `capabilities.agents` | Host knows to use agent-first path |
+| `agents/list` | Roster only: name, description, **capability labels** |
+| `agents/get` (or select) | Optional instructions + **scoped tool schemas** |
+| `tools/call` | Unchanged — same server executes tools |
 
-### What we want from MCP
+Protocol + host policy define the behavior. SDKs expose matching registration helpers
+(see **§6.6**); the JSON-RPC methods remain the contract.
 
-A portable way to advertise **delegatable agents**, so hosts can route like deep agents —
-agent tuples on the wire; LangGraph, checkpoints, and middleware stay in the app.
+### 6.2 Expected sequence
 
-### Discovery payload
+```mermaid
+sequenceDiagram
+    participant User
+    participant Host as Host MCP Client
+    participant Sup as Supervisor LLM
+    participant Sub as Subagent LLM
+    participant Server as MCP Server
+
+    Note over Host,Server: Connect agent-first - skip flat tools list
+    Host->>Server: initialize
+    Server-->>Host: capabilities.agents
+
+    Host->>Server: agents/list
+    Server-->>Host: roster cards only - no tool schemas
+
+    User->>Host: Check failed pipelines and pending approvals
+    Host->>Sup: request plus agent cards only
+    Sup-->>Host: select workflow-agent
+
+    Host->>Server: agents/get workflow-agent
+    Server-->>Host: instructions plus scoped tool schemas
+
+    Note over Host: Build local subagent - supervisor has no full tool dump
+
+    Host->>Sub: task plus instructions plus scoped tools
+    loop Tool loop
+        Sub-->>Host: list_failed_pipelines
+        Host->>Server: tools/call
+        Server-->>Host: CallToolResult
+        Host->>Sub: result
+    end
+
+    Sub-->>Host: compact result
+    Host->>Sup: result
+    Sup-->>Host: final answer
+    Host-->>User: response
+```
+
+### 6.3 Example payloads
+
+**`agents/list` (roster — labels only):**
 
 ```jsonc
 {
   "agents": [
     {
-      "agentId": "workflow-agent",
-      "description": "Pipelines, automation tasks, approval gates, run history, connectors",
-      "capabilities": [
-        "Pipeline catalog and execution",
-        "Approval gates: list, approve, reject",
-        "Run history and run analysis"
-      ],
-      "exampleTasks": [
-        "Show pending pipeline approvals",
-        "Why did pipeline X fail on its latest run?"
-      ],
-      "delegateTool": "invoke_workflow_agent",
-      "tasksEnabled": true,
-      "skillUri": "skill://workflow-agent/SKILL.md"
+      "name": "workflow-agent",
+      "description": "Pipelines, approvals, deployments, incidents",
+      "capabilities": ["failed pipelines", "pending approvals", "change requests"]
+    },
+    {
+      "name": "research-agent",
+      "description": "Outages, CVEs, internal runbooks",
+      "capabilities": ["web search", "internal docs"]
+    },
+    {
+      "name": "insights-agent",
+      "description": "DORA, error budget, release risk",
+      "capabilities": ["dora", "risk score", "charts"]
     }
   ]
 }
 ```
 
-### Invoke after route
+**Not** in this payload: `tools: [...]`, full schemas, required `model`, required `systemPrompt`
+(model / prompt may appear later as **optional**, host-overridable).
+
+**`agents/get` (first time tools appear):**
 
 ```jsonc
 {
-  "method": "tools/call",
-  "params": {
-    "name": "invoke_workflow_agent",
-    "arguments": { "query": "Show pending pipeline approvals" }
-  }
+  "agent": "workflow-agent",
+  "instructions": "You handle CI/CD and approvals for the named service.",
+  "tools": [
+    {
+      "name": "list_failed_pipelines",
+      "description": "List recent failed CI/CD runs",
+      "inputSchema": { "type": "object", "properties": { "service": { "type": "string" } } }
+    },
+    {
+      "name": "list_pending_approvals",
+      "description": "List approval gates still waiting",
+      "inputSchema": { "type": "object", "properties": { "service": { "type": "string" } } }
+    }
+  ]
 }
 ```
 
-### Wire shape (open for debate)
+**Nesting (later / optional)** — child agents / tools as `{ type, name }` refs, **same-server-only**
+for MVP.
 
-| Option | Idea |
-|--------|------|
-| A | `agents/list` (+ optional `agents/get`) |
-| B | Resources under `agent://…` |
-| C | Extension `io.modelcontextprotocol/agents` on discover / settings |
+### 6.4 Why this benefits users (not “extra work”)
 
-Semantic ask is fixed: **agent tuples for routing; tools stay behind the delegate.**
+Users never call `agents/list`. Hosts do. One extra RPC per specialist choice is **host
+plumbing**. Users get: better routing, fewer wrong tool picks, lower token cost on large
+servers (POC: flat MCP supervisor context much larger than a 3-card roster).
+
+### 6.5 Does this break existing MCP?
+
+**No if additive.** Servers without `capabilities.agents` keep flat `tools/list`. Old clients
+ignore unknown capabilities. `tools/call` stays the execution path. Breaking would be
+*removing* flat tools for everyone — Proposal 1 does not do that.
+
+### 6.6 SDK registration for builders (V1 sketch)
+
+Builders keep registering **tools** as today. Agents are a thin registry that **points at tool
+names**. Wire format is **JSON**; Markdown authoring can come later as an optional loader.
+
+**Mental model**
+
+```text
+@mcp.tool(...)     → ToolManager   (schemas + handlers)   — unchanged
+@mcp.agent(...)    → AgentManager  (card + tool name refs) — new
+agents/list        → cards only
+agents/get(name)   → resolve refs → Tool[] from ToolManager
+tools/call         → ToolManager   — unchanged
+```
+
+**How builders register tools onto a subagent**
+
+1. Define tools with `@mcp.tool` (same as today).
+2. Register an agent and pass `tools=[...]` as **string names** of those tools.
+3. Same tool may appear on more than one agent if needed.
+
+```python
+from mcp.server import MCPServer
+
+mcp = MCPServer("sdlc")
+
+# 1) Tools — registered globally (handlers + schemas), as today
+@mcp.tool()
+def list_failed_pipelines(service: str) -> str:
+    """List recent failed CI/CD runs for a service."""
+    ...
+
+@mcp.tool()
+def list_pending_approvals(service: str) -> str:
+    """List approval gates still waiting."""
+    ...
+
+@mcp.tool()
+def search_cves(query: str) -> str:
+    """Search CVE / advisories."""
+    ...
+
+# 2) Agents — roster card + which tools belong to this specialist
+@mcp.agent(
+    name="workflow-agent",
+    description="Pipelines, approvals, deployments",
+    capabilities=["failed pipelines", "pending approvals"],
+    tools=["list_failed_pipelines", "list_pending_approvals"],  # bind by name
+    instructions="You handle CI/CD for the named service.",      # optional
+)
+def workflow_agent():
+    """Marker for the agent registry (no LLM on the server)."""
+    ...
+
+@mcp.agent(
+    name="research-agent",
+    description="Outages, CVEs, runbooks",
+    capabilities=["web search", "CVEs"],
+    tools=["search_cves"],
+)
+def research_agent():
+    ...
+```
+
+Equivalent without a decorator body — dict / `add_agent` (Deep Agents–like):
+
+```python
+mcp.add_agent({
+    "name": "workflow-agent",
+    "description": "Pipelines, approvals, deployments",
+    "capabilities": ["failed pipelines", "pending approvals"],
+    "tools": ["list_failed_pipelines", "list_pending_approvals"],
+    "instructions": "You handle CI/CD for the named service.",
+})
+```
+
+**What the host sees from that registration**
+
+| Call | Result |
+| ---- | ------ |
+| `agents/list` | `{ name, description, capabilities }` only — **no** tool schemas |
+| `agents/get("workflow-agent")` | instructions + full schemas for `list_failed_pipelines`, `list_pending_approvals` |
+| `tools/call` | Same tool handlers as today |
+
+**Client helpers (sketch)**
+
+```python
+agents = await session.list_agents()           # roster
+detail = await session.get_agent("workflow-agent")  # scoped Tool[]
+# then tools/call as today
+```
+
+**V1 rules for builders**
+
+| Do | Don't |
+| -- | ----- |
+| Register tools first, then bind by **name** | Put full JSON schemas inside the agent definition |
+| Advertise `capabilities.agents` only if agents exist | Require every server to define agents |
+| Keep `tools/list` for non-agent clients | Remove flat tools in V1 |
+
+**Later (not V1):** optional `mcp.agents.load_markdown_dir("./agents")` (Pi-style MD → same
+`AgentManager`). Wire stays JSON.
 
 ---
 
 ## 7. FAQ
+
+Questions encountered in the **Agents WG session on Friday 24 Jul 2026**, plus follow-up
+research while comparing approaches.
+
+### What approaches did we compare, and what are the pros/cons?
+
+| # | Approach | Idea | Pros | Cons |
+| - | -------- | ---- | ---- | ---- |
+| **A** | Flat `tools/list` (today) | All schemas at connect | Simple; works now | Token sprawl; bad routing at scale |
+| **B** | Resource as “agent card” | Doc / `agent://…` lists specialists | No new primitive | Does **not** stop flat `tools/list`; often worse (resources + tools) |
+| **C** | Opaque invoke / mega-tool | e.g. `invoke_workflow_agent(query)` → private APIs | Small tools/list; good for black boxes | No specialist schemas; harder to compose / authz per tool |
+| **D** | **Proposal 1 — agents/list + get** | Roster → scoped tools → `tools/call` | Progressive disclosure; Deep-Agents-like; additive | Needs SEP + host support |
+| **E** | One MCP server per subagent | Separate server per specialist | Strong isolation | N hops, N auth; client invents the roster |
+| **F** | Skills / Server Cards only | How-to packs or server metadata | Good for knowledge / ads | Do not **bound** tools in supervisor context |
+
+**Lean:** prefer **D**; keep **C** for intentionally opaque remotes; treat **B/F** as docs aids, not substitutes.
 
 ### Why can’t tools just be subagents?
 
@@ -410,26 +608,64 @@ mis-picks. Subagents are **who first, then which tool**.
 
 ### Is agent definition another server?
 
-No. The registry should live **in the same MCP server** as the specialists — not a separate
-“agent-definition” server that fans out to other servers for subagent configs and toolsets.
+No. The registry lives **in the same MCP server** as the specialists.
 
-Direction from the WG discussion (waiting on Luca’s sequence proposal):
-
-1. One server code defines the supervisor shape and its subagents (names, capabilities, scoped
-   tool sets)
-2. `agents/list` returns those subagent **names + capabilities** (roster only)
-3. The **client** chooses which subagent it needs
-4. The **same server** then returns that subagent’s tools (and handles invoke)
-
-So: deep-agent supervisor + subagent registry + toolsets, colocated — discovery is agent-first,
-tools stay behind the chosen specialist.
+1. One server defines agent cards + scoped tool sets  
+2. `agents/list` → roster only  
+3. Host selects an agent  
+4. `agents/get` → that agent’s tools; `tools/call` on the **same** server  
 
 ### Why not host each subagent as a remote MCP server?
 
-That is Approach 1 — fine for opaque remote agents, but each specialist becomes another hop,
-another deploy/auth surface, and still no shared roster unless every client invents one. Prefer
-colocating the registry with the specialists (see above) unless the specialist is intentionally
-opaque and remote.
+Approach **E** — fine for isolation, but each specialist is another hop/auth surface, and there
+is still no shared roster unless every client invents one. Prefer colocated registry (**D**)
+unless the specialist is intentionally opaque and remote (**C**).
+
+### Why not expose only “selector” tools, and let them call non-exposed tools / APIs?
+
+Two different meanings of “non-exposed”:
+
+| Meaning | Possible today? | Verdict |
+| ------- | ----------------- | ------- |
+| **Private backend APIs** (HTTP, DB) inside one MCP tool handler | Yes | Approach **C** (opaque). Valid, but host never sees specialist tool schemas. |
+| **Other MCP tools** hidden from `tools/list` but still client-callable | No standard | Hostile to normal discovery; not how hosts work. |
+| **Server-internal** helpers never registered as MCP tools | Yes | Same as C: only registered tools appear on the wire. |
+
+```text
+C:  Supervisor sees invoke_workflow_agent only → server black box
+D:  Supervisor sees workflow-agent card → after get, sub-agent sees list_failed_pipelines schema
+```
+
+### Why not put the agent roster in a Resource?
+
+Resources are **read-only context**. They do not change `tools/list`. If the host still loads
+all tools at connect → roster **plus** full schemas → square one.
+
+### Isn’t agents/list → get → tools/call extra work for users?
+
+Users don’t do those RPCs; hosts do. Extra round-trips buy progressive disclosure: smaller
+supervisor context, clearer routing, same `tools/call` execution model.
+
+### Will this break clients / is it a huge protocol change?
+
+Additive capability. Flat path remains. Execution remains `tools/call`. Hosts that never heard
+of `agents` behave as today.
+
+### Can SDK middleware or an “Agent class” replace a wire primitive?
+
+No. Middleware wraps requests (logging, tracing, authz). Discovery policy needs a **protocol
+method** (+ host behavior). Ergonomic server APIs can come later; they are not a substitute
+for `agents/list` / `agents/get` on the wire.
+
+### What about Skills / Server Cards?
+
+Skills = on-demand **how-to**. Server Cards = **server** metadata. Useful for advertising,
+but neither replaces **bounded tool visibility** for a supervisor.
+
+### Is Proposal 1 “MCP becomes an agent” (LLM on the server)?
+
+No. Server stays roster + tools. LLMs stay on the host (supervisor + local sub-agent in
+catalog mode). Opaque server-side invoke remains optional via Approach **C**.
 
 ---
 
