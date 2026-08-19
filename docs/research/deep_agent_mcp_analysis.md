@@ -1,7 +1,11 @@
-# Deep Agent Architecture vs MCP Agents
+# Agent workflow comparison and MCP agent capabilities
 
-> Compare how **deep-agent** systems build effective multi-agent orchestration with what
-> **MCP Agents** offers today — and one concrete improvement: **agent definition**.
+> Compare **Deep Agents** methodology with what **MCP Agents** offers today, identify the
+> gaps, and extend MCP so hosts can discover and compose those capabilities on the wire.
+
+This document starts from how Deep Agents builds effective multi-agent workflows
+(supervisor + registered sub-agents + scoped tools), maps that shape onto MCP, and proposes
+one additive extension: **agent-first discovery**.
 
 ---
 
@@ -16,23 +20,11 @@ agent-definition** layer on the wire.
 This document:
 
 1. Introduces **Deep Agents** ([docs](https://docs.langchain.com/oss/python/deepagents/subagents)) — lineage from LangChain / LangGraph, capabilities, skills, and how tools/subagents attach
-2. Contrasts that shape with a typical MCP **server / tools** sequence
-3. Proposes **Proposal 1: agent-first discovery** (`agents/list` → `agents/get` → scoped `tools/call`), including a **Python SDK registration sketch** for builders (§6.6)
+2. Contrasts that shape with a typical MCP **server / tools** sequence (including today’s discovery TTL and Task TTL)
+3. Proposes **Proposal 1: progressive agent-first discovery** (`agents/list` → `agents/get` → scoped `tools/call`), including SDK registration (§6.6) and **agent TTL / list-changed** (§6.7)
 4. Captures **WG session Q&A** (approaches, objections, pros/cons) in the FAQ
 
 Other Agents WG approaches exist ([PR #5](https://github.com/modelcontextprotocol/agents-wg/pull/5)). This doc uses the **supervisor–subagent tree** as the reference stress test.
-
-### Terms used throughout
-
-| Term | Meaning |
-| ---- | ------- |
-| **Host / MCP client** | App that owns the LLM(s) and speaks MCP |
-| **MCP server** | Exposes tools / resources / prompts (no LLM required) |
-| **Roster / agent card** | `{ name, description, capabilities[] }` — **labels only**, no tool schemas |
-| **Scoped tools** | Tool schemas visible only after selecting an agent |
-| **Progressive disclosure** | Small discovery first; detail on demand |
-| **Catalog mode** | Host builds a **local** sub-agent LLM from `agents/get`; leaf work still uses `tools/call` on the same server |
-| **Capability negotiation** | `initialize` advertises `capabilities.agents` → host chooses agent-first vs flat tools |
 
 ---
 
@@ -286,40 +278,73 @@ sequenceDiagram
 
 ---
 
-## 4. Typical MCP server sequence
+## 4. Typical MCP server sequence *(today — flat tools)*
 
 What hosts talk to in production: an **MCP server** exposing tools — not a first-class agent
 roster. Sometimes the tool wraps a remote/opaque worker (see
 [mcp-agent-tools.md](./mcp-agent-tools.md)); that worker stays behind `tools/call`.
 
+Two clocks already exist on this path. **Do not mix them:**
+
+| Kind | Where | Who manages freshness |
+| ---- | ----- | --------------------- |
+| **Discovery cache TTL** (`ttlMs` + `cacheScope` on list results) | `tools/list` (also resources / prompts; CacheableResult / SEP-2549) | Server hint; client may cache until expiry |
+| **Task TTL** (`ttlMs` on a **Task**) | Tasks extension | Server retention of an async job; client may treat as backstop |
+
+There is **no per-tool TTL**. Default discovery `ttlMs` is often `0` (do not cache). Rolling
+deploy invalidates via `notifications/tools/list_changed` (or TTL expiry) — there is no
+separate “deployment happened” event.
+
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Server as MCP Server
-    participant API as Backend API
-    participant Worker as Backend worker OPAQUE
+    participant Client as MCP client
+    participant Cache as Client cache
 
-    Client->>Server: tools/call some_tool
-    Server->>API: dispatch work
-    API->>Worker: start job
-    API-->>Server: ack
-
-    loop brief poll or wait
-        Server->>API: check status
-        API-->>Server: pending or done
-        Server->>Client: notifications progress optional
+    box rgb(255,250,240) MCP server
+        participant MW as Middleware
+        participant Disp as Request dispatcher
+        participant TM as ToolManager
+        participant API as Backend API
     end
+
+    Note over Client,Disp: Discovery (tools/list TTL)
+    Client->>MW: tools/list
+    MW->>Disp: tools/list
+    Disp->>TM: list tools
+    TM-->>Disp: Tool[]
+    Disp-->>Client: tools + ttlMs + cacheScope
+    Client->>Cache: store until ttlMs
+
+    Note over Client,Cache: Within TTL reuse cache - skip tools/list
+    Client->>MW: tools/call some_tool
+    MW->>Disp: tools/call
+    Disp->>TM: invoke handler
+    TM->>API: do work
 
     alt completed soon
-        Server-->>Client: CallToolResult with outcome
-    else still running
-        Server-->>Client: pending message
-        Note over Server,Client: Tasks extension is the clean fix
-        Note over Server,Client: return taskId then tasks/get
+        API-->>TM: outcome
+        TM-->>Disp: CallToolResult
+        Disp-->>Client: CallToolResult
+    else still running (Tasks extension)
+        TM-->>Disp: task handle + task ttlMs
+        Disp-->>Client: CreateTaskResult
+        loop Until complete or task TTL
+            Client->>MW: tasks/get
+            MW->>Disp: tasks/get
+            Disp-->>Client: status
+        end
     end
+
+    Note over Disp: Rolling deploy - tool set changed
+    Disp-->>Client: notifications/tools/list_changed
+    Client->>Cache: invalidate tools/list
+    Client->>MW: tools/list
+    MW->>Disp: tools/list
+    Disp-->>Client: fresh tools + ttlMs
 ```
 
-**Works well:** standard remote invoke; Tasks cleans up long polls.
+**Works well:** standard remote invoke; discovery TTL + list-changed keep the catalog fresh;
+Tasks TTL is a separate job-retention clock.
 
 ---
 
@@ -341,14 +366,16 @@ sequenceDiagram
 
 ---
 
-## 6. Proposal 1: Agent-first discovery
+## 6. Proposal 1: Progressive agent-first discovery
 
-> **After sync with WG discussion** (including comments from [@lucabutboring](https://github.com/lucabutboring) on catalog-style local sub-agents):  
-> `agents/list` is **roster-only** (no tool names/schemas). Hosts that advertise
-> `capabilities.agents` must **not** call flat `tools/list` at connect — otherwise the
-> supervisor sees agents **and** all tools (square one). Tool schemas appear only after
-> `agents/get` for the selected agent; leaf execution stays `tools/call` on the **same**
-> server. LLMs stay on the host.
+> **After sync with WG discussion** (including comments from [@LucaButBoring](https://github.com/LucaButBoring) on catalog-style local sub-agents):  
+> `agents/list` is **roster-only** (no tool names/schemas). Hosts that see agents capability
+> must **not** call flat `tools/list` at connect — otherwise the supervisor sees agents **and**
+> all tools (square one). Tool schemas appear only after `agents/get` for the selected agent;
+> leaf execution stays `tools/call` on the **same** server. LLMs stay on the host.
+>
+> **POC wire (Python SDK + sdlc-mcp):** advertise via `capabilities.experimental.agents`.
+> Handlers: `agents/list`, `agents/get`; notification: `notifications/agents/list_changed`.
 
 Deep agents scale because the supervisor sees an **agent registry**, not every tool:
 
@@ -356,7 +383,7 @@ Deep agents scale because the supervisor sees an **agent registry**, not every t
 BAD (flat tools as discovery):
   Orchestrator sees 70 tool schemas → picks the tool itself → sprawl, mis-routes
 
-GOOD (agent-first discovery):
+GOOD (Progressive agent-first discovery):
   Orchestrator sees 3 agent cards → selects workflow-agent →
   host loads THAT agent’s tools only → specialist picks the tool
 ```
@@ -365,55 +392,69 @@ GOOD (agent-first discovery):
 
 | Piece | Role |
 | ----- | ---- |
-| `initialize` → `capabilities.agents` | Host knows to use agent-first path |
-| `agents/list` | Roster only: name, description, **capability labels** |
-| `agents/get` (or select) | Optional instructions + **scoped tool schemas** |
-| `tools/call` | Unchanged — same server executes tools |
+| `initialize` / discover → agents capability | Host knows to use agent-first path (POC: `experimental.agents`) |
+| `agents/list` | Roster only: name, description, **capability labels** (+ optional `ttlMs`) |
+| `agents/get` | Optional instructions + **scoped tool schemas** (+ optional `ttlMs`) |
+| `notifications/agents/list_changed` | Invalidate roster + get caches; then list → get |
+| `tools/call` | Unchanged — same server executes tools via **ToolManager** |
 
 Protocol + host policy define the behavior. SDKs expose matching registration helpers
 (see **§6.6**); the JSON-RPC methods remain the contract.
 
-### 6.2 Expected sequence
+Agent capability is **centralized in AgentManager**, registered as **request handlers** on the
+dispatcher — same pattern as tools/resources. **Middleware** (OTEL, auth) wraps the call; it
+does **not** own the roster.
+
+### 6.2 Expected sequence (MCP client ↔ MCP server)
+
+The **MCP client** speaks JSON-RPC. Routing / LLMs stay in the host app (off the wire). The
+server has **no LLM** — the dispatcher sends agent RPCs to **AgentManager** and tool RPCs to
+**ToolManager**.
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Host as Host MCP Client
-    participant Sup as Supervisor LLM
-    participant Sub as Subagent LLM
-    participant Server as MCP Server
+    participant Client as MCP client
 
-    Note over Host,Server: Connect agent-first - skip flat tools list
-    Host->>Server: initialize
-    Server-->>Host: capabilities.agents
-
-    Host->>Server: agents/list
-    Server-->>Host: roster cards only - no tool schemas
-
-    User->>Host: Check failed pipelines and pending approvals
-    Host->>Sup: request plus agent cards only
-    Sup-->>Host: select workflow-agent
-
-    Host->>Server: agents/get workflow-agent
-    Server-->>Host: instructions plus scoped tool schemas
-
-    Note over Host: Build local subagent - supervisor has no full tool dump
-
-    Host->>Sub: task plus instructions plus scoped tools
-    loop Tool loop
-        Sub-->>Host: list_failed_pipelines
-        Host->>Server: tools/call
-        Server-->>Host: CallToolResult
-        Host->>Sub: result
+    box rgb(255,250,240) MCP server (no LLM)
+        participant MW as Middleware
+        participant Disp as Request dispatcher
+        participant AM as AgentManager
+        participant TM as ToolManager
     end
 
-    Sub-->>Host: compact result
-    Host->>Sup: result
-    Sup-->>Host: final answer
-    Host-->>User: response
+    Note over Client,Disp: Connect - agent-first (skip flat tools/list)
+    Client->>MW: initialize
+    MW->>Disp: initialize
+    Disp-->>Client: experimental.agents (listChanged, defaultTtlMs)
+
+    Client->>MW: agents/list
+    MW->>Disp: agents/list
+    Disp->>AM: list cards
+    AM-->>Disp: AgentCard[] (labels only)
+    Disp-->>Client: roster + ttlMs + cacheScope
+
+    Note over Client: Host selects workflow-agent from roster (off wire)
+    Client->>MW: agents/get workflow-agent
+    MW->>Disp: agents/get
+    Disp->>AM: resolve agent
+    AM->>TM: lookup tool schemas by name
+    TM-->>AM: scoped Tool[]
+    AM-->>Disp: instructions + tools
+    Disp-->>Client: GetAgentResult + ttlMs + cacheScope
+
+    loop tools/call (same server)
+        Client->>MW: tools/call list_failed_pipelines
+        MW->>Disp: tools/call
+        Disp->>TM: invoke handler
+        TM-->>Disp: CallToolResult
+        Disp-->>Client: CallToolResult
+    end
 ```
 
 ### 6.3 Example payloads
+
+`ttlMs` / `cacheScope` sit on the **result** (same CacheableResult pattern as `tools/list`),
+not on each card or tool. There is still **no per-tool TTL**.
 
 **`agents/list` (roster — labels only):**
 
@@ -435,7 +476,9 @@ sequenceDiagram
       "description": "DORA, error budget, release risk",
       "capabilities": ["dora", "risk score", "charts"]
     }
-  ]
+  ],
+  "ttlMs": 60000,
+  "cacheScope": "private"
 }
 ```
 
@@ -459,7 +502,9 @@ sequenceDiagram
       "description": "List approval gates still waiting",
       "inputSchema": { "type": "object", "properties": { "service": { "type": "string" } } }
     }
-  ]
+  ],
+  "ttlMs": 60000,
+  "cacheScope": "private"
 }
 ```
 
@@ -474,9 +519,9 @@ servers (POC: flat MCP supervisor context much larger than a 3-card roster).
 
 ### 6.5 Does this break existing MCP?
 
-**No if additive.** Servers without `capabilities.agents` keep flat `tools/list`. Old clients
-ignore unknown capabilities. `tools/call` stays the execution path. Breaking would be
-*removing* flat tools for everyone — Proposal 1 does not do that.
+**No if additive.** Servers without an agents capability keep flat `tools/list`. Old clients
+ignore unknown capabilities / experimental keys. `tools/call` stays the execution path.
+Breaking would be *removing* flat tools for everyone — Proposal 1 does not do that.
 
 ### 6.6 SDK registration for builders (V1 sketch)
 
@@ -580,6 +625,93 @@ detail = await session.get_agent("workflow-agent")  # scoped Tool[]
 
 **Later (not V1):** optional `mcp.agents.load_markdown_dir("./agents")` (Pi-style MD → same
 `AgentManager`). Wire stays JSON.
+
+### 6.7 TTLs, notifications, and the agents gap
+
+*(WG follow-up: rolling deploy / cache freshness)*
+
+Today’s **tools/list TTL** and **Task TTL** are already on the typical MCP path in §4.
+Proposal 1 needs the **same discovery clock on agents**, independent of `tools/list`.
+
+| Piece | Status |
+| ----- | --- |
+| `agents/list` / `agents/get` results | **CacheableResult** (`ttlMs`, `cacheScope`) — agent-controlled, independent of `tools/list` |
+| `notifications/agents/list_changed` | **Added** (`ctx.notify_agents_changed()`); capability advertises `listChanged: true` |
+| `tools/call` | No discovery TTL; in-flight calls are not cancelled by list TTL |
+| Tasks TTL | No agents work — still the job-retention clock from §4 |
+
+**Recommended freshness model (keep it simple)**
+
+- Put `ttlMs` **on agent discovery only** (`agents/list`, `agents/get`) — MCP agent builders own this via `agents_ttl_ms` / `set_agents_cache_policy`.
+- **V1 priority = agent TTL**; `tools/list` TTL is secondary / light for agent-first hosts (they should not flat-list tools anyway).
+- There is **no per-tool TTL**.
+- Notifications are best-effort (transport / host support varies) → **TTL is the backstop**.
+- On change or TTL expiry: invalidate **both** roster and get caches, then `agents/list` **then** `agents/get` (not get-only).
+
+**Why list then get (not get-only)?**
+
+Roster can change independently of one agent’s tool set: new agents, removed agents, description/capability label edits. `agents/get` alone misses that. Cost is one cheap roster RPC.
+
+**In-flight** `tools/call` **during rolling deploy**
+
+```text
+1. tools/call already in flight → let it finish (success or error). Do not abort for TTL.
+2. On agents/list_changed (or agent ttlMs expiry):
+     - invalidate agents/list + agents/get caches
+     - do NOT start a new tools/call until refresh completes
+3. Before the next tools/call (or before loading schemas into the specialist LLM):
+     - agents/list  (refresh roster / capability labels)
+     - agents/get   (refresh scoped schemas for still-selected agent)
+4. If get shows the tool was removed/renamed → host fails closed / re-routes; do not call stale name
+```
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP client
+    participant Cache as Client cache
+
+    box rgb(255,250,240) MCP server
+        participant MW as Middleware
+        participant Disp as Request dispatcher
+        participant AM as AgentManager
+        participant TM as ToolManager
+    end
+
+    Client->>MW: agents/list
+    MW->>Disp: agents/list
+    Disp->>AM: cards
+    AM-->>Disp: AgentCard[]
+    Disp-->>Client: cards + ttlMs
+    Client->>Cache: store roster
+
+    Client->>MW: agents/get workflow-agent
+    MW->>Disp: agents/get
+    Disp->>AM: resolve
+    AM->>TM: scoped schemas
+    TM-->>AM: Tool[]
+    AM-->>Disp: instructions + tools
+    Disp-->>Client: tools + ttlMs
+    Client->>Cache: store get
+
+    Client->>MW: tools/call list_pending_approvals
+    MW->>Disp: tools/call
+    Disp->>TM: invoke
+    Note over Disp: Deploy rolls - schemas change
+    Disp-->>Client: notifications/agents/list_changed
+    Note over Client: In-flight call may still complete
+
+    Client->>Cache: invalidate agent caches
+    Client->>MW: agents/list
+    MW->>Disp: agents/list
+    Disp-->>Client: fresh cards + ttlMs
+    Client->>MW: agents/get workflow-agent
+    MW->>Disp: agents/get
+    Disp-->>Client: fresh scoped tools + ttlMs
+    Client->>MW: tools/call next tool
+    MW->>Disp: tools/call
+```
+
+**V1 ask:** cacheable `agents/list` + `agents/get`; `agents/list_changed`; host refresh = **list then get**; agent-owned TTL (not tools/list). No Tasks/TTL coupling.
 
 ---
 
