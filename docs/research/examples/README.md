@@ -14,7 +14,7 @@ Same SDLC scenario: `payments-service` v2.4.
 
 ## PR path — MCP server only (no observability)
 
-Needs: Python 3.11+, the experimental SDK in this workspace (`mcp-agents-poc/python-sdk`).
+Needs: Python 3.11+, the draft-extension SDK in this workspace (`mcp-agents-poc/python-sdk`).
 No Groq key for `--discover-only`.
 
 ```text
@@ -42,7 +42,7 @@ python -m client.main --discover-only
 Expected:
 
 ```text
-mcp:initialize → sdlc-release-readiness …
+mcp:server/discover → sdlc-release-readiness …
 mcp:agents/list → 3 agents (roster only)
   - workflow-agent: …
   - research-agent: …
@@ -52,8 +52,10 @@ mcp:agents/get research-agent → N tools
 mcp:agents/get insights-agent → N tools
 ```
 
-Server advertises `experimental.agents`. Roster has **labels only**; tool schemas appear
-only after `agents/get`. TTL is on the **result** (`ttlMs`), not per tool.
+Server advertises `io.modelcontextprotocol/agents` through formal extension capabilities,
+and the client declares support in per-request metadata. The roster has **labels only**;
+tool schemas appear only after `agents/get`. TTL is on the **result** (`ttlMs`), not per
+tool.
 
 ### Optional: LLM turn (same server)
 

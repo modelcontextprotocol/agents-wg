@@ -1,7 +1,7 @@
 """SDLC MCP server — agent-first discovery + tools/call.
 
-Wire (when capabilities.experimental.agents is present):
-  Client ──initialize──► Server  (experimental.agents)
+Wire (when the formal agent discovery extension is negotiated):
+  Client ──server/discover──► Server  (io.modelcontextprotocol/agents)
   Client ──agents/list──► Server  (roster cards only)
   Client ──agents/get──► Server   (scoped tool schemas)
   Client ──tools/call──► Server   (unchanged)
@@ -187,7 +187,7 @@ INSIGHTS_TOOLS = [
 ]
 
 def register_agents() -> None:
-    """Advertise experimental.agents. Skip this for the flat tools/list demo."""
+    """Advertise the agent extension. Skip this for the flat tools/list demo."""
     mcp.add_agent(
         name="workflow-agent",
         description="Pipelines, approvals, deployments, incidents",

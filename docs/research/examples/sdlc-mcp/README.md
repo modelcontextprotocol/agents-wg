@@ -19,7 +19,7 @@ Specialist picks tools                 Specialist LLM sees scoped schemas
 ```text
 Client                         Server (MCPServer + AgentManager)
 ──────                         ────────────────────────────────
-initialize  ─────────────────► experimental.agents
+server/discover ─────────────► io.modelcontextprotocol/agents
 agents/list ─────────────────► roster cards only (+ ttlMs)
 agents/get  ─────────────────► scoped Tool[] (+ ttlMs)
 tools/call  ─────────────────► ToolManager handler → backend

@@ -16,6 +16,7 @@ from typing import Any
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp_types.extensions.agents import AGENTS_EXTENSION_IDENTIFIER
 
 _ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_ROOT / ".env")
@@ -162,17 +163,16 @@ async def _select_agents(question: str, roster, *, model) -> list[str]:
 
 
 async def discover(session: ClientSession) -> dict[str, Any]:
-    init = await session.initialize()
-    server_info = getattr(init, "serverInfo", None) or getattr(init, "server_info", None)
+    init = await session.discover()
+    server_info = session.server_info
     name = getattr(server_info, "name", None) if server_info else None
     print(
-        f"mcp:initialize → {name} protocol="
-        f"{getattr(init, 'protocolVersion', None) or getattr(init, 'protocol_version', None)}"
+        f"mcp:server/discover → {name or 'server'} protocol={session.protocol_version}"
     )
 
     caps = getattr(init, "capabilities", None)
-    experimental = getattr(caps, "experimental", None) or {}
-    if "agents" in experimental:
+    extensions = getattr(caps, "extensions", None) or {}
+    if AGENTS_EXTENSION_IDENTIFIER in extensions:
         roster = await session.list_agents()
         print(f"mcp:agents/list → {len(roster.agents)} agents (roster only)")
         for a in roster.agents:
@@ -259,7 +259,11 @@ def _server_params(server_module: str) -> StdioServerParameters:
 
 async def run_discover_only(*, server_module: str) -> None:
     async with stdio_client(_server_params(server_module)) as (read, write):
-        async with ClientSession(read, write) as session:
+        async with ClientSession(
+            read,
+            write,
+            extensions={AGENTS_EXTENSION_IDENTIFIER: {}},
+        ) as session:
             discovery = await discover(session)
             if discovery.get("mode") != "agent-first":
                 return
@@ -274,7 +278,11 @@ async def run_discover_only(*, server_module: str) -> None:
 
 async def run_session(question: str, *, server_module: str) -> str:
     async with stdio_client(_server_params(server_module)) as (read, write):
-        async with ClientSession(read, write) as session:
+        async with ClientSession(
+            read,
+            write,
+            extensions={AGENTS_EXTENSION_IDENTIFIER: {}},
+        ) as session:
             discovery = await discover(session)
             return await ask(question, session=session, discovery=discovery)
 
@@ -285,7 +293,11 @@ async def interactive(*, server_module: str) -> None:
     print(f"Mode: {'FLAT tools/list' if flat else 'AGENT-FIRST agents/list'}\n")
 
     async with stdio_client(_server_params(server_module)) as (read, write):
-        async with ClientSession(read, write) as session:
+        async with ClientSession(
+            read,
+            write,
+            extensions={AGENTS_EXTENSION_IDENTIFIER: {}},
+        ) as session:
             discovery = await discover(session)
             print("Ready. Type a question, or q to quit.\n")
             while True:

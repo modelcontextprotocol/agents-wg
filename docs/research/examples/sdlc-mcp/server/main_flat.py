@@ -1,7 +1,7 @@
 """Flat MCP server — same tools as ``server.main``, but **no agents**.
 
-Does not call ``register_agents()``, so ``initialize`` will not advertise
-``experimental.agents``. Clients use classic ``tools/list`` (~18 schemas).
+Does not call ``register_agents()``, so ``server/discover`` will not advertise
+``io.modelcontextprotocol/agents``. Clients use classic ``tools/list`` (~18 schemas).
 
   python -m server.main_flat
 """
