@@ -248,6 +248,12 @@ Agent selection occurs inside the host and is not a protocol request. The protoc
 not prescribe whether selection is performed by a model, deterministic rules, user
 choice, or another routing strategy.
 
+A host MAY represent a discovered agent as a local, non-MCP delegation tool for its
+supervisor or orchestration framework. Such a tool can resolve the selected agent through
+`agents/get`, construct a local specialist using the returned instructions and tool
+schemas, and return a compact result to the supervisor. This is host-side orchestration;
+it does not introduce an `agents/call` method or change MCP tool execution.
+
 A host using agent-first discovery **SHOULD NOT** place the complete flat tool catalog and
 the agent-scoped tool schemas into the same routing context, because doing so removes the
 progressive-disclosure benefit. This does not prohibit a host from using `tools/list` for
@@ -508,45 +514,43 @@ instructions; discovery metadata must not override host security policy or user 
 
 ## Reference Implementation
 
-An experimental implementation is available in a fork of the MCP Python SDK:
+An updated draft implementation is maintained in a fork of the MCP Python SDK:
 
-- [Python SDK prototype commit](https://github.com/madhaviai/python-sdk/commit/ff1f5ac1f4f31818c909d70eabf6836ebf438f22)
-- Branch: `feat/mcp-agents-exp`
+- [Python SDK agent discovery branch](https://github.com/madhaviai/python-sdk/tree/feat/mcp-agents-exp)
+- Original [prototype commit](https://github.com/madhaviai/python-sdk/commit/ff1f5ac1f4f31818c909d70eabf6836ebf438f22)
 
-The prototype demonstrates:
+The updated implementation demonstrates:
 
+- formal extension advertisement using `io.modelcontextprotocol/agents`;
+- per-request client extension declaration and server-side enforcement;
+- shared agent wire contracts used by both client and server;
 - server-side agent registration and management;
 - compact roster discovery and scoped agent details;
 - client session methods for both discovery steps;
 - result-level `ttlMs` and `cacheScope`;
 - execution through the existing `tools/call` path;
 - basic error handling for unknown agents and missing tool references;
-- a smoke test covering experimental capability advertisement, discovery, scoping, and
+- tests covering extension negotiation, wire serialization, discovery, scoping, and
   tool execution.
 
-The prototype predates this Extensions Track draft. It currently advertises
-`capabilities.experimental.agents` as an incubation mechanism rather than the proposed
-`io.modelcontextprotocol/agents` extension identifier. It should not be treated as a
-conforming implementation of this draft.
-
-For error handling, the prototype currently uses `-32602` (Invalid params) for both an
+For error handling, the implementation currently uses `-32602` (Invalid params) for both an
 unknown agent and an agent definition that references unavailable tools. The Working
 Group still needs to agree on the extension's error contract before this behavior is
 treated as normative.
 
-The prototype also contains an early manual agent-list-changed notification surface. It
-does not yet provide complete client cache invalidation or modern subscription delivery,
-and remains exploratory while notification behavior is an open design question.
+Pagination and agent-change notifications are intentionally not implemented while those
+behaviors remain open design questions. If change notifications are added, they should
+integrate with `subscriptions/listen` rather than introduce a separate delivery mechanism.
 
 A runnable example and setup instructions are available with the supporting research:
 
 - [Research PR #20](https://github.com/modelcontextprotocol/agents-wg/pull/20)
 - [Runnable example](https://github.com/madhaviai/agents-wg/blob/deep-agents-vs-mcp-agents/docs/research/examples/README.md)
 
-After the Working Group agrees on the initial wire shape, the reference implementation
-will be updated to use formal extension negotiation and the agreed shared protocol types.
-Features that remain open in this draft, such as notifications or pagination, will be
-implemented only if they are included in the reviewed extension design.
+The reference implementation tracks the current draft and will continue to change as the
+Working Group reviews the wire shape. Features that remain open, such as notifications or
+pagination, will be implemented only if they are included in the reviewed extension
+design.
 
 ## Future Direction
 
