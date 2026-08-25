@@ -16,7 +16,7 @@ Pending charter backfill.
 
 ## Meetings
 
-**Cadence:** Biweekly
+**Cadence:** Weekly
 **Day:** Fridays at 10:00am PST
 **Duration:** 30 minutes
 **Format:** Virtual
