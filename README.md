@@ -9,7 +9,7 @@ Pending charter backfill.
 ## Communication
 
 - **Primary Channel:** [MCP Discord](https://discord.com/invite/6CSzBmMkjX) → `#agents-wg`
-- **Meetings:** Biweekly, 30 minutes
+- **Meetings:** Weekly, 30 minutes
   - Meeting agendas posted in Discord ≥48 hours in advance
 - **Work Tracking:** GitHub Issues and Discussions in this repository
 - **Reporting:** Regular updates to the broader MCP community
