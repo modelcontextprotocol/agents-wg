@@ -21,7 +21,7 @@ The extension addresses a scaling problem in servers that expose large and diver
 catalogs. Sending every tool schema to a model at connection time increases context size,
 cost, latency, and the likelihood of incorrect tool selection. Agent discovery introduces
 progressive disclosure: the host initially receives concise routing information and loads
-detailed instructions and tool schemas only for the selected specialist.
+detailed instructions and tool schemas only for the selected agent.
 
 This proposal does not turn an MCP server into an autonomous agent runtime. Agent
 selection and model orchestration remain host responsibilities. The extension defines
@@ -39,46 +39,38 @@ Large flat catalogs create several practical problems:
 1. **Context growth** — unrelated tool schemas consume model context and increase token
    cost.
 2. **Routing ambiguity** — similar or overlapping tools make correct selection harder.
-3. **Poor progressive disclosure** — hosts cannot discover a specialist first and load
+3. **Poor progressive disclosure** — hosts cannot discover an agent first and load
    its detailed tools only when needed.
 4. **Tight host configuration** — without a protocol-level grouping mechanism, each host
-   must maintain its own mapping of specialists to tools.
+   must maintain its own mapping of agents to tools.
 5. **Inconsistent interoperability** — custom selector tools, resources, or private
    registries solve the problem differently and do not provide a common host behavior.
 
-Many agent systems address this by giving a supervisor a concise roster of specialists
-instead of every leaf tool. MCP can provide the same discovery benefit without defining
-how agents reason, execute, retain state, or communicate. A server can describe logical
-agents and their scoped tool sets while preserving the existing MCP execution model.
+Many agent frameworks already support supervisor-subagent orchestration in some form.
+Examples include Deep Agents subagents, LangGraph supervisor patterns, Google ADK
+sub-agent hierarchies, OpenAI Agents SDK handoffs and agents-as-tools, and Microsoft Agent
+Framework orchestration patterns. In these systems, a supervisor delegates a work item to
+a selected subagent, and that subagent uses a bounded tool set to decide which tools to
+call. Flat tool discovery instead commonly requires the supervisor to route directly
+across every exposed tool schema.
+
+This extension plugs into existing host orchestration by discovering a concise agent
+roster first and retrieving tool schemas only for the selected agent. This reduces the
+schemas and tokens loaded into the supervisor's context while preserving `tools/call` for
+execution; delegation and agent execution remain host responsibilities.
 
 The desired user experience is simple: users make ordinary requests, while the host
 performs discovery and routing automatically. The additional discovery steps are host
 plumbing and are not exposed as actions the user must invoke.
 
-## Goals and Direction
+This extension addresses an immediate use case: populating existing host-side subagent
+registries from MCP servers. A host can discover a compact roster, select an agent,
+retrieve its instructions and scoped tool schemas, and execute those tools through the
+existing MCP tool-calling mechanism without requiring additional agent capabilities.
 
-The immediate goal is to establish an interoperable foundation for agent-oriented
-capabilities in MCP. The first version focuses on discovery and progressive disclosure:
-a host receives a compact roster for routing, then retrieves detailed instructions and
-tool schemas only for the selected agent. Tool execution continues through the existing
-MCP tool-calling mechanism.
-
-The design is intended to support a broader range of agent requirements over time without
-forcing them into the first version. It provides a common extension namespace and
-negotiation point where future, independently reviewed capabilities can evolve from
-implementation experience—for example richer agent metadata, composition, delegation,
-interaction patterns, and lifecycle information.
-
-The direction is to:
-
-- give hosts a consistent way to discover and route to agent capabilities;
-- reduce context size and routing ambiguity through progressive disclosure;
-- preserve interoperability across different agent frameworks and implementations;
-- support cacheable discovery with clear freshness behavior;
-- remain optional and backward compatible for clients and servers that do not implement
-  the extension;
-- create a stable foundation that can accommodate additional agent requirements without
-  prematurely prescribing one orchestration architecture.
+The discovery model can also provide a foundation for future, independently reviewed
+capabilities informed by implementation experience, such as richer agent metadata,
+composition, delegation, interaction patterns, or lifecycle information.
 
 ## Specification
 
@@ -93,8 +85,7 @@ io.modelcontextprotocol/agents
 ### Capability Negotiation
 
 Clients and servers explicitly declare support for the extension using the MCP extension
-negotiation mechanism. Supporting the base MCP protocol does not imply support for agent
-discovery.
+negotiation mechanism.
 
 A client declares support in its per-request capabilities:
 
@@ -119,12 +110,18 @@ A server declares support in its discovery response:
   "result": {
     "capabilities": {
       "extensions": {
-        "io.modelcontextprotocol/agents": {}
+        "io.modelcontextprotocol/agents": {
+          "listChanged": true
+        }
       }
     }
   }
 }
 ```
+
+The optional `listChanged` setting indicates that the server supports agent-roster change
+notifications. Omitting it or setting it to `false` indicates that such notifications are
+not supported.
 
 A client **MUST NOT** assume agent discovery is available unless the server advertises the
 extension. A server **MUST NOT** require clients to support this extension in order to use
@@ -141,12 +138,11 @@ process, model, endpoint, or MCP server.
 
 Discovery is intentionally divided into two levels:
 
-1. **Roster** — compact agent cards used to select a relevant specialist.
+1. **Roster** — compact agent cards used to select a relevant agent.
 2. **Details** — instructions and full tool schemas for one selected agent.
 
-This separation is the basis of progressive disclosure. Agent cards **MUST NOT** contain
-tool names or tool schemas. Capability labels are descriptive routing hints and **MUST
-NOT** be treated as executable MCP tools.
+This separation is the basis of progressive disclosure. Capability labels are descriptive
+routing hints; clients do not interpret them as references to executable MCP tools.
 
 The extension defines the following wire types:
 
@@ -162,12 +158,12 @@ interface AgentCard {
   capabilities: string[];
 }
 
-interface ListAgentsRequest extends Request {
+interface ListAgentsRequest extends PaginatedRequest {
   method: "agents/list";
-  params: RequestParams;
+  params: PaginatedRequestParams;
 }
 
-interface ListAgentsResult extends CacheableResult {
+interface ListAgentsResult extends PaginatedResult, CacheableResult {
   resultType: "complete";
   agents: AgentCard[];
 }
@@ -187,18 +183,28 @@ interface GetAgentResult extends CacheableResult {
   /** Name of the agent to which these details belong. */
   agent: string;
 
-  /** Optional guidance that a host may use when invoking this specialist. */
+  /** Optional guidance that a host may use when invoking this agent. */
   instructions?: string;
 
   /** Existing MCP Tool objects scoped to this agent. */
   tools: Tool[];
 }
+
+interface AgentListChangedNotification extends Notification {
+  method: "notifications/agents/list_changed";
+  params?: NotificationParams;
+}
 ```
 
 Each agent name **MUST** be unique within the roster visible to the requesting client.
-Servers **MAY** associate the same tool with more than one agent. Every returned tool
-**MUST** remain callable through the existing MCP tool-calling mechanism, subject to the
-same authorization context and server policy as any other tool call.
+Servers **MAY** associate the same tool with more than one agent. Tool names are
+server-scoped; this extension does not create agent-local tool namespaces. If the
+same tool name appears under multiple agents, it **MUST** identify the same server-wide
+callable tool. Every returned tool **MUST** also be discoverable through `tools/list` and
+remain callable through the existing MCP tool-calling mechanism, subject to the same
+authorization context and server policy as any other tool call.
+When `tools/list` and `agents/get` responses are produced from the same server state and
+authorization context, all fields of the corresponding `Tool` definitions **MUST** match.
 
 Agent membership does not grant additional authorization. A server **MUST** filter both
 the roster and agent details according to the requesting client's effective permissions.
@@ -217,12 +223,14 @@ tools through the existing `tools/call` method on the same MCP server.
 The expected flow is:
 
 1. The client and server negotiate support for the extension.
-2. The host requests the visible agent roster.
-3. The host selects an agent using its name, description, and capability labels.
-4. The host retrieves details for the selected agent.
-5. The host makes the selected agent's instructions and tool schemas available to its
+2. The host **MAY** request the complete visible tool catalog through `tools/list` for
+   existing discovery, indexing, or SDK operation.
+3. The host requests the visible agent roster.
+4. The host selects an agent using its name, description, and capability labels.
+5. The host retrieves details for the selected agent.
+6. The host makes the selected agent's instructions and tool schemas available to its
    orchestration or model layer.
-6. The host invokes tools using the existing MCP tool-calling mechanism.
+7. The host invokes tools using the existing MCP tool-calling mechanism.
 
 ```mermaid
 sequenceDiagram
@@ -231,6 +239,11 @@ sequenceDiagram
 
     H->>S: Discover server capabilities
     S-->>H: io.modelcontextprotocol/agents
+
+    opt Existing tool discovery or indexing
+        H->>S: tools/list
+        S-->>H: Complete visible Tool[]
+    end
 
     H->>S: agents/list
     S-->>H: Agent cards + cache metadata
@@ -244,20 +257,26 @@ sequenceDiagram
     S-->>H: Existing tool result
 ```
 
+This extension does not change `tools/list` semantics. A server **MUST NOT** omit a tool
+from `tools/list` solely because that tool is associated with one or more agents.
+
 Agent selection occurs inside the host and is not a protocol request. The protocol does
 not prescribe whether selection is performed by a model, deterministic rules, user
 choice, or another routing strategy.
 
 A host MAY represent a discovered agent as a local, non-MCP delegation tool for its
 supervisor or orchestration framework. Such a tool can resolve the selected agent through
-`agents/get`, construct a local specialist using the returned instructions and tool
+`agents/get`, construct a local agent using the returned instructions and tool
 schemas, and return a compact result to the supervisor. This is host-side orchestration;
 it does not introduce an `agents/call` method or change MCP tool execution.
 
 A host using agent-first discovery **SHOULD NOT** place the complete flat tool catalog and
 the agent-scoped tool schemas into the same routing context, because doing so removes the
 progressive-disclosure benefit. This does not prohibit a host from using `tools/list` for
-other operational purposes.
+other operational purposes. Existing systems that already call `tools/list` **MAY** retain
+that behavior for indexing, schema validation, and other host operations. Progressive
+disclosure concerns which tool schemas the host presents to the model's routing context,
+not whether the host requests or stores the complete catalog.
 
 #### Listing Agents
 
@@ -268,7 +287,9 @@ Clients request the roster using `agents/list`:
   "jsonrpc": "2.0",
   "id": 1,
   "method": "agents/list",
-  "params": {}
+  "params": {
+    "cursor": "optional-cursor-value"
+  }
 }
 ```
 
@@ -299,11 +320,27 @@ The server returns compact cards only:
         ]
       }
     ],
+    "nextCursor": "next-page-cursor",
     "ttlMs": 60000,
     "cacheScope": "private"
   }
 }
 ```
+
+`agents/list` uses the standard MCP pagination model. Clients omit `cursor` for the first
+page and continue with the returned `nextCursor` until the response omits it.
+
+#### Agent Roster Changes
+
+A server that advertises `listChanged: true` for this extension supports
+`notifications/agents/list_changed`. Clients opt in by adding `agentsListChanged: true` to
+the `notifications` filter of a `subscriptions/listen` request. The server acknowledges
+and delivers the notification using the standard MCP subscription mechanism.
+
+The notification indicates that the visible roster or one or more agent cards may have
+changed. A client receiving it **SHOULD** invalidate all cached `agents/list` pages and
+re-list before making a new routing decision. After re-listing, it **SHOULD** discard
+cached `agents/get` results for agents that are no longer visible.
 
 #### Retrieving Agent Details
 
@@ -351,28 +388,6 @@ The response is scoped to that agent:
 }
 ```
 
-The returned `tools` entries use the existing MCP `Tool` type. A server **MUST NOT**
-return a tool through `agents/get` if that tool is not callable by the requesting client
-under the same authorization context.
-
-#### Invoking a Tool
-
-The client invokes a selected tool using the existing core method:
-
-```jsonc
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "list_failed_pipelines",
-    "arguments": {
-      "service": "payments"
-    }
-  }
-}
-```
-
 Tool call request and response semantics are unchanged by this extension. The server
 dispatches the call through its existing tool implementation; the agent grouping provides
 discovery scope and does not create an additional execution layer.
@@ -381,48 +396,34 @@ discovery scope and does not create an additional execution layer.
 
 Both `agents/list` and `agents/get` results follow the MCP `CacheableResult` model defined
 by [SEP-2549](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/seps/2549-TTL-for-list-results.md).
-Their results include:
 
-- `ttlMs`: the number of milliseconds for which the client may reuse the response;
-- `cacheScope`: whether the response is safe for a shared cache (`public`) or restricted
-  to the requesting authorization context (`private`).
+The roster is one cache entry, and each `agents/get` result is a separate entry keyed by
+agent name.
 
-A `ttlMs` value of `0` means the result is immediately stale. Servers **MUST NOT** return
-a negative value.
+For both `agents/list` and `agents/get`, servers **SHOULD** use `private` unless they can
+guarantee that the particular response is identical and safe for every client. This is
+especially important when agent visibility, agent instructions, or tool availability
+depends on authorization.
 
-Clients **MAY** cache the roster and agent details. A client that caches these results
-follows the standard MCP cache-scope semantics. An `agents/get` entry is cached separately
-for each agent name.
+The TTL of an agent's details does not extend the roster TTL, and the roster TTL does not
+extend any previously retrieved details. These TTLs apply only to discovery results; they
+do not alter Tasks retention or cancel in-flight tool calls.
 
-Servers **SHOULD** use `private` unless they can guarantee that the response is identical
-and safe for every client. This is especially important when agent visibility, agent
-instructions, or tool availability depends on authorization.
+### Error Handling
 
-Roster and detail results are cached independently. The TTL of an agent's details does
-not extend the TTL of the roster, and the roster TTL does not extend the TTL of any
-previously retrieved details.
+Agent discovery uses existing JSON-RPC error codes with a stable `reason` discriminator in
+the error `data` object:
 
-When a cached result expires, a host **SHOULD** refresh it before using its contents to
-prepare a new agent-routed tool call. Expiry does not cancel or otherwise change the
-semantics of a `tools/call` request that is already in progress.
+- If the requested agent does not exist or is not visible to the requesting client, the
+  server **MUST** return `-32602` (`Invalid params`) with
+  `data.reason: "agent_not_found"`. Clients **MAY** refresh `agents/list` and retry.
+- If an agent definition references a tool that is unavailable under the same server
+  configuration, the server **MUST** return `-32603` (`Internal error`) with
+  `data.reason: "invalid_agent_definition"`. Clients **SHOULD NOT** retry until the server
+  configuration changes.
 
-The TTL applies to agent discovery only. It is not a per-tool TTL, does not alter the
-retention semantics of the Tasks extension, and does not cancel in-flight tool calls.
-
-## Open Design Questions
-
-The initial proposal intentionally leaves the following questions open for Agents Working
-Group review:
-
-1. **Change notifications** — Is TTL-based refresh sufficient for the first version, or
-   should the extension define an agent-list-changed event? If so, should it use
-   `subscriptions/listen`, and which cached results should a client invalidate?
-2. **Pagination** — Does the compact roster need cursor-based pagination in the first
-   version, or can pagination be added after implementation experience?
-3. **Error handling** — Which existing MCP/JSON-RPC errors should apply to an unknown
-   agent, invalid agent request, missing extension support, or an agent definition that
-   references unavailable tools? Does agent discovery require any dedicated extension
-   error code?
+Servers **MUST NOT** distinguish a nonexistent agent from an agent hidden by authorization,
+because doing so could disclose the existence of an inaccessible agent.
 
 ## Rationale
 
@@ -434,8 +435,13 @@ flat tool discovery and the extension would not provide meaningful progressive
 disclosure.
 
 `agents/get` forms the second level because a host needs complete MCP `Tool` definitions
-before it can expose or invoke the selected tools. This preserves MCP's existing schema
-and execution model rather than introducing a second representation of tools.
+before it can expose or invoke the selected tools. Returning only tool names would require
+an agent-first host to fetch the complete `tools/list` catalog and reconstruct agent
+membership locally. Returning the selected definitions directly keeps `agents/get`
+self-contained, avoids transferring unrelated schemas when `tools/list` is not otherwise
+needed, and leaves the server authoritative for authorization-scoped agent membership.
+The definitions still use the existing MCP `Tool` type and must remain consistent with
+their `tools/list` counterparts, preserving MCP's existing schema and execution model.
 
 ### Host-Side Selection
 
@@ -446,23 +452,26 @@ other approaches to use the same discovery protocol.
 
 ### Same-Server Tool Execution
 
-The selected tool is called on the same MCP server through `tools/call`. This avoids
-requiring one deployment, connection, authentication flow, or transport hop per logical
-agent. It also preserves existing tool handlers, middleware, authorization, and result
-semantics.
+Selected tools are invoked through the existing `tools/call` method, preserving MCP tool
+handlers, middleware, authorization, and result semantics. Agent grouping remains a
+discovery concern and does not require servers to adopt a particular runtime, process, or
+internal orchestration architecture.
 
 ### Alternatives Considered
 
 **Flat tool discovery.** Existing `tools/list` remains suitable for smaller catalogs, but
-does not provide a compact specialist roster or progressive schema loading for larger
+does not provide a compact agent roster or progressive schema loading for larger
 servers.
 
-**Resources as agent cards.** A resource can describe an agent, but it does not establish
-a standard relationship between that description and a bounded set of callable tools.
-Hosts may still load both the resource and the full tool catalog.
+**Resources as agent cards.** A specialized resource format could carry agent metadata
+and its relationship to a bounded set of tools. However, it would appear through ordinary
+resource discovery and could be presented as normal content by clients that do not
+support agent discovery. Unless it duplicated complete tool definitions, hosts would
+still need to join it with `tools/list`. Dedicated, capability-gated methods provide typed
+agent semantics without overloading the resource model.
 
 **Selector or mega-tools.** A server can expose one tool that privately routes to internal
-agents or APIs. This reduces the visible tool catalog, but hides specialist tool schemas
+agents or APIs. This reduces the visible tool catalog, but hides agent tool schemas
 and makes composition, authorization, and interoperability dependent on a custom tool
 contract.
 
@@ -471,9 +480,13 @@ require hosts to discover and connect to multiple servers and to construct an ag
 outside MCP. The proposal supports logical agents within one server without preventing
 deployments that choose stronger isolation.
 
-**Skills or server cards.** Skills and server metadata can provide useful instructions or
-descriptions, but do not by themselves progressively disclose a selected subset of MCP
-tool schemas.
+**Skills or server cards.** These formats could be extended to include agent metadata and
+tool relationships. However, server cards describe a server as a whole, while skills
+primarily package reusable instructions or knowledge. Agent discovery represents multiple
+dynamic, authorization-scoped tool groupings with independent listing, retrieval, caching,
+and change behavior. Adding those semantics to skills or server cards would couple
+distinct abstractions and effectively recreate dedicated agent-discovery operations
+within them.
 
 ## Backward Compatibility
 
@@ -533,14 +546,9 @@ The updated implementation demonstrates:
 - tests covering extension negotiation, wire serialization, discovery, scoping, and
   tool execution.
 
-For error handling, the implementation currently uses `-32602` (Invalid params) for both an
-unknown agent and an agent definition that references unavailable tools. The Working
-Group still needs to agree on the extension's error contract before this behavior is
-treated as normative.
-
-Pagination and agent-change notifications are intentionally not implemented while those
-behaviors remain open design questions. If change notifications are added, they should
-integrate with `subscriptions/listen` rather than introduce a separate delivery mechanism.
+The implementation currently uses `-32602` (`Invalid params`) for both an unknown agent
+and an agent definition that references unavailable tools. It does not yet implement the
+pagination, notification, or distinguishable error behavior specified above.
 
 A runnable example and setup instructions are available with the supporting research:
 
@@ -548,16 +556,14 @@ A runnable example and setup instructions are available with the supporting rese
 - [Runnable example](https://github.com/madhaviai/agents-wg/blob/deep-agents-vs-mcp-agents/docs/research/examples/README.md)
 
 The reference implementation tracks the current draft and will continue to change as the
-Working Group reviews the wire shape. Features that remain open, such as notifications or
-pagination, will be implemented only if they are included in the reviewed extension
-design.
+Working Group reviews the wire shape.
 
 ## Future Direction
 
-This first proposal establishes discovery and progressive disclosure. Future proposals
+This proposal establishes discovery and progressive disclosure. Future proposals
 may build on implementation experience to explore richer metadata, composition,
 delegation, interaction patterns, or lifecycle information. Those capabilities are not
-defined by this initial wire shape and require separate review.
+defined by this wire shape and require separate review.
 
 ## References
 
