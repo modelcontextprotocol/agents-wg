@@ -1,0 +1,177 @@
+{
+  "service": "payments-service",
+  "version": "v2.4.0",
+  "release_window": "2026-07-18T14:00:00Z",
+  "failed_pipelines": [
+    {
+      "name": "payments-service-ci",
+      "run_id": 441,
+      "stage": "integration-tests",
+      "status": "failed",
+      "failed_at": "2026-07-17T08:12:00Z",
+      "error": "AssertionError: charge_idempotency_key mismatch",
+      "branch": "release/v2.4"
+    },
+    {
+      "name": "payments-deploy-staging",
+      "run_id": 902,
+      "stage": "smoke",
+      "status": "failed",
+      "failed_at": "2026-07-16T22:40:00Z",
+      "error": "HTTP 503 from /v1/checkout",
+      "branch": "release/v2.4"
+    },
+    {
+      "name": "payments-contract-tests",
+      "run_id": 118,
+      "stage": "pact",
+      "status": "failed",
+      "failed_at": "2026-07-15T16:05:00Z",
+      "error": "Consumer wallet-app expects refund.status enum",
+      "branch": "main"
+    }
+  ],
+  "pending_approvals": [
+    {
+      "pipeline": "payments-deploy-prod",
+      "stage": "gate-security",
+      "owner": "alice",
+      "due": "overdue",
+      "ticket": "SEC-2041"
+    },
+    {
+      "pipeline": "payments-deploy-prod",
+      "stage": "gate-change-advisory",
+      "owner": "bob",
+      "due": "2026-07-18",
+      "ticket": "CAB-889"
+    }
+  ],
+  "pipeline_runs": {
+    "441": {
+      "name": "payments-service-ci",
+      "run_id": 441,
+      "duration_sec": 842,
+      "commit": "a1b2c3d",
+      "author": "dev-payments",
+      "logs_tail": "FAILED tests/test_idempotency.py::test_retry_same_key"
+    },
+    "902": {
+      "name": "payments-deploy-staging",
+      "run_id": 902,
+      "duration_sec": 410,
+      "commit": "a1b2c3d",
+      "author": "ci-bot",
+      "logs_tail": "smoke: GET /v1/checkout -> 503"
+    }
+  },
+  "change_requests": [
+    {
+      "id": "CR-4412",
+      "title": "Enable new refunds API in prod",
+      "service": "payments-service",
+      "risk": "high",
+      "status": "open",
+      "approvers_needed": 2,
+      "approvers_done": 1
+    },
+    {
+      "id": "CR-4418",
+      "title": "Bump stripe-sdk 11.2 -> 12.0",
+      "service": "payments-service",
+      "risk": "medium",
+      "status": "open",
+      "approvers_needed": 1,
+      "approvers_done": 0
+    }
+  ],
+  "deployments": [
+    {"env": "dev", "version": "v2.4.0-rc3", "at": "2026-07-16T10:00:00Z", "success": true},
+    {"env": "staging", "version": "v2.4.0-rc3", "at": "2026-07-16T22:30:00Z", "success": false},
+    {"env": "prod", "version": "v2.3.9", "at": "2026-07-10T14:00:00Z", "success": true}
+  ],
+  "service_owners": {
+    "payments-service": {
+      "team": "payments-platform",
+      "oncall": "alice@example.com",
+      "slack": "#payments-oncall",
+      "repo": "github.com/acme/payments-service"
+    },
+    "wallet-app": {
+      "team": "mobile",
+      "oncall": "cara@example.com",
+      "slack": "#mobile-oncall",
+      "repo": "github.com/acme/wallet-app"
+    }
+  },
+  "dora_metrics": {
+    "payments-service": {
+      "deployment_frequency_per_week": 3.2,
+      "lead_time_hours": 28.5,
+      "change_failure_rate_pct": 18.0,
+      "mttr_hours": 4.2,
+      "window_days": 30
+    }
+  },
+  "error_budget": {
+    "payments-service": {
+      "slo_target_pct": 99.9,
+      "availability_pct_30d": 99.82,
+      "budget_remaining_pct": 42.0,
+      "burn_rate_1h": 1.8,
+      "burn_rate_6h": 1.1
+    }
+  },
+  "slo_burn": {
+    "payments-service": {
+      "latency_p99_ms": 420,
+      "error_rate_pct": 0.35,
+      "checkout_success_pct": 98.7,
+      "series": [
+        {"day": "D-6", "errors": 12, "deploys": 1},
+        {"day": "D-5", "errors": 9, "deploys": 0},
+        {"day": "D-4", "errors": 15, "deploys": 2},
+        {"day": "D-3", "errors": 22, "deploys": 1},
+        {"day": "D-2", "errors": 31, "deploys": 1},
+        {"day": "D-1", "errors": 28, "deploys": 0},
+        {"day": "D0", "errors": 40, "deploys": 1}
+      ]
+    }
+  },
+  "incidents": [
+    {
+      "id": "INC-902",
+      "service": "payments-service",
+      "severity": "P2",
+      "title": "Elevated 503 on /v1/checkout in staging",
+      "status": "investigating",
+      "opened_at": "2026-07-16T22:45:00Z"
+    }
+  ],
+  "feature_flags": [
+    {"key": "refunds_v2", "env": "staging", "enabled": true},
+    {"key": "refunds_v2", "env": "prod", "enabled": false},
+    {"key": "checkout_circuit_breaker", "env": "prod", "enabled": true}
+  ],
+  "test_flakes": [
+    {"suite": "integration-tests", "test": "test_retry_same_key", "flake_rate_pct": 12.0},
+    {"suite": "pact", "test": "wallet_refund_status", "flake_rate_pct": 4.0}
+  ],
+  "web_search_fallback": [
+    {
+      "title": "Stripe API degraded performance — status history",
+      "url": "https://status.stripe.com/example",
+      "snippet": "Intermittent elevated error rates on Charges API in us-east-1 (last 7 days)."
+    },
+    {
+      "title": "CVE-2024-XXXX: Out-of-bounds in popular payment SDK",
+      "url": "https://nvd.nist.gov/example",
+      "snippet": "Affects payment SDKs prior to 12.x; upgrade recommended before production rollout."
+    },
+    {
+      "title": "Checkout 503 patterns in multi-region gateways",
+      "url": "https://engineering.example.com/checkout-503",
+      "snippet": "Common causes: upstream idempotency store lag, circuit breaker storms, contract drift."
+    }
+  ]
+}
